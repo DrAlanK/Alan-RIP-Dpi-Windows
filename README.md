@@ -14,7 +14,7 @@
 
 <br>
 
-<img src="assets/screenshot.png" alt="Alan-RIP-Dpi Main Dashboard" width="92%">
+<img src="assets/AlanRIPDpi.jpg" alt="Alan-RIP-Dpi Main Dashboard" width="92%">
 
 </div>
 
