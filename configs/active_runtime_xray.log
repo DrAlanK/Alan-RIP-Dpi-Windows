@@ -1,7 +1,0 @@
-Xray 26.3.27 (Xray, Penetrates Everything.) d2758a0 (go1.26.1 windows/amd64)
-A unified platform for anti-censorship.
-2026/11/05 15:57:36.593705 [Info] infra/conf/serial: Reading config: &{Name:c:\Users\A\Desktop\Alan-RIP-Dpi\configs\active_runtime.json Format:json}
-2026/11/05 15:57:36.610391 [Warning] common/errors: The feature WebSocket transport (with ALPN http/1.1, etc.) is deprecated, not recommended for using and might be removed. Please migrate to XHTTP H2 & H3 as soon as possible.
-2026/11/05 15:57:36.614330 [Warning] common/errors: The feature Trojan (with no Flow, etc.) is deprecated, not recommended for using and might be removed. Please migrate to VLESS with Flow & Seed as soon as possible.
-2026/11/05 15:57:36.633175 [Warning] core: Xray 26.3.27 started
-2026/11/05 15:57:36.890092 from DNS accepted udp:1.1.1.1:53 [xray.system.e9ca25b9-dab9-42d5-b7f2-e3209f56ace8 >> proxy-out]

@@ -12,3 +12,7 @@ configs/.auto_pool_url
 core/*.exe
 core/*.dll
 core/*.dat
+
+configs/*.log
+commit.ps1
+upload_release.py
