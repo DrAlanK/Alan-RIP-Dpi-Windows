@@ -18,6 +18,7 @@ from alan_dpi.engine.clean_ip import CleanIpScanner, SEED_CLEAN_IPS
 from alan_dpi.engine.models import (
     BypassVector,
     EngineSettings,
+    LocationExtractor,
     EngineState,
     ProfileNode,
     SubscriptionItem,
@@ -77,6 +78,8 @@ SETTING_KEY_ALIASES = {
     "sys_proxy": "system_proxy_enabled",
     "autopilot": "autopilot_enabled",
     "auto_pool": "auto_pool_enabled",
+    "auto_location": "preferred_auto_location",
+    "location": "preferred_auto_location",
     "tun": "tun_enabled",
     "tray": "minimize_to_tray",
     "sub_update_hours": "sub_auto_update_hours",
@@ -162,6 +165,7 @@ class AlanAutoPilotEngine:
         self.on_profiles: Optional[Callable[[List[dict], int], None]] = None
         self._on_profiles_changed = on_profiles_changed
         self.on_verified_outputs = on_verified_outputs
+        self.on_auto_locations: Optional[Callable[[List[dict], str], None]] = None
         self.on_settings = on_settings_changed
         self.on_subscriptions = on_subscriptions_changed
         self.on_scan_row = on_scan_row
@@ -293,42 +297,45 @@ class AlanAutoPilotEngine:
             return bool(res[0]), int(res[1]), float(res[2]), str(res[3])
         return bool(res.passed), int(res.ping_ms), 0.0, str(getattr(res, "detail", ""))
 
-    def _resolve_candidate_endpoints(
+    def _resolve_origin_endpoint(self, node: ProfileNode) -> str:
+        if not CleanIpScanner.is_cdn_eligible(node):
+            node.cached_clean_ip = ""
+        resolved_orig = CleanIpScanner.resolve_unpoisoned_ipv4(node.original_host, timeout=1.6)
+        if resolved_orig and (not CleanIpScanner.is_poisoned_ip(resolved_orig)):
+            return resolved_orig
+        if node.original_host and (not CleanIpScanner.is_poisoned_ip(node.original_host)):
+            return node.original_host
+        return ""
+
+    def _discover_fallback_clean_ips(
         self,
         node: ProfileNode,
         gen_id: int,
         port_edge_cache: Optional[Dict[int, List[str]]] = None,
-        sample_count: int = 36,
+        sample_count: int = 34,
     ) -> List[str]:
+        if (not self.settings.auto_clean_ip) or (not CleanIpScanner.is_cdn_eligible(node)):
+            return []
         candidates: List[str] = []
         if node.cached_clean_ip and (not CleanIpScanner.is_poisoned_ip(node.cached_clean_ip)):
             candidates.append(node.cached_clean_ip)
-
-        is_cdn = CleanIpScanner.is_cdn_eligible(node)
-        if self.settings.auto_clean_ip and is_cdn:
-            if (port_edge_cache is not None) and (node.port in port_edge_cache):
-                discovered_ips = port_edge_cache[node.port]
-            else:
-                edges = CleanIpScanner.discover_best_ips(
-                    port=node.port,
-                    top_n=3,
-                    sample_count=sample_count,
-                    probe_sni="speed.cloudflare.com",
-                    log_fn=self.emit_log,
-                    abort_check=lambda: self._is_op_cancelled(gen_id),
-                )
-                discovered_ips = [ip_val for ip_val, _ in edges]
-                if port_edge_cache is not None:
-                    port_edge_cache[node.port] = discovered_ips
-            for ip_val in discovered_ips:
-                if ip_val and (ip_val not in candidates):
-                    candidates.append(ip_val)
-
-        resolved_orig = CleanIpScanner.resolve_unpoisoned_ipv4(node.original_host, timeout=1.6)
-        if resolved_orig and (resolved_orig not in candidates):
-            candidates.append(resolved_orig)
-        if (not candidates) and node.original_host:
-            candidates.append(node.original_host)
+        if (port_edge_cache is not None) and (node.port in port_edge_cache):
+            discovered_ips = port_edge_cache[node.port]
+        else:
+            edges = CleanIpScanner.discover_best_ips(
+                port=node.port,
+                top_n=3,
+                sample_count=sample_count,
+                probe_sni="speed.cloudflare.com",
+                log_fn=self.emit_log,
+                abort_check=lambda: self._is_op_cancelled(gen_id),
+            )
+            discovered_ips = [ip_val for ip_val, _ in edges]
+            if port_edge_cache is not None:
+                port_edge_cache[node.port] = discovered_ips
+        for ip_val in discovered_ips:
+            if ip_val and (ip_val not in candidates):
+                candidates.append(ip_val)
         return candidates[:3]
 
     def get_visible_profiles(self) -> List[ProfileNode]:
@@ -695,20 +702,86 @@ class AlanAutoPilotEngine:
             except Exception as exc:
                 self.emit_log(f"[Subscriptions] Write error: {exc}")
 
+    @staticmethod
+    def _parse_worker_pool_payload(raw_text: str) -> List[ProfileNode]:
+        txt = (raw_text or "").strip()
+        if not txt:
+            return []
+
+        entries: List[Tuple[str, str]] = []
+        seen_uris = set()
+
+        def _add_uri(u_str: str, loc_hint: str = ""):
+            u_clean = (u_str or "").strip()
+            if u_clean and any(u_clean.lower().startswith(s) for s in UriConfigCodec.SUPPORTED_SCHEMES):
+                if u_clean not in seen_uris:
+                    seen_uris.add(u_clean)
+                    entries.append((u_clean, (loc_hint or "").strip()))
+
+        if txt.startswith(("[", "{")):
+            try:
+                parsed_json = json.loads(txt)
+                if isinstance(parsed_json, dict):
+                    list_found = None
+                    for wrap_key in ("configs", "nodes", "items", "data", "proxies", "servers"):
+                        if isinstance(parsed_json.get(wrap_key), list):
+                            list_found = parsed_json[wrap_key]
+                            break
+                    if list_found is not None:
+                        parsed_json = list_found
+                    else:
+                        for loc_k, val_list in parsed_json.items():
+                            if isinstance(val_list, list):
+                                for item in val_list:
+                                    if isinstance(item, str):
+                                        _add_uri(item, str(loc_k))
+                                    elif isinstance(item, dict):
+                                        u_v = item.get("uri") or item.get("config") or item.get("link") or item.get("url") or ""
+                                        l_v = item.get("location") or item.get("country_code") or item.get("country") or item.get("cc") or item.get("loc") or loc_k
+                                        _add_uri(str(u_v), str(l_v))
+                if isinstance(parsed_json, list):
+                    for item in parsed_json:
+                        if isinstance(item, str):
+                            _add_uri(item, "")
+                        elif isinstance(item, dict):
+                            u_v = item.get("uri") or item.get("config") or item.get("link") or item.get("url") or item.get("u") or ""
+                            l_v = item.get("location") or item.get("country_code") or item.get("country") or item.get("cc") or item.get("loc") or item.get("c") or ""
+                            _add_uri(str(u_v), str(l_v))
+            except Exception:
+                pass
+
+        if not entries:
+            for u in UriConfigCodec.extract_uris_from_blob(txt):
+                _add_uri(u, "")
+
+        nodes: List[ProfileNode] = []
+        for u_val, loc_val in entries:
+            try:
+                nd = UriConfigCodec.extract_profile_node(
+                    u_val,
+                    group_tag="__AUTO_POOL__",
+                    is_hidden=True,
+                    explicit_country=loc_val,
+                )
+                nodes.append(nd)
+            except Exception:
+                continue
+        return nodes
+
     def _load_hidden_pool_cache(self) -> List[ProfileNode]:
         if os.path.exists(self.hidden_cache_path):
             try:
                 with open(self.hidden_cache_path, "rb") as fh:
                     dec = base64.b64decode(fh.read()).decode("utf-8", errors="ignore")
-                uris = UriConfigCodec.extract_uris_from_blob(dec)
-                nodes = [UriConfigCodec.extract_profile_node(u, group_tag="__AUTO_POOL__", is_hidden=True) for u in uris]
+                nodes = self._parse_worker_pool_payload(dec)
                 meta = self._load_pool_meta()
                 for nd in nodes:
                     key = hashlib.sha1(nd.uri.encode("utf-8", errors="ignore")).hexdigest()[:16]
                     entry = meta.get(key)
                     if isinstance(entry, dict):
                         nd.cached_vector_id = str(entry.get("vec") or "")
-                        nd.cached_clean_ip = str(entry.get("ip") or "")
+                        saved_ip = str(entry.get("ip") or "")
+                        nd.cached_clean_ip = saved_ip if CleanIpScanner.is_cdn_eligible(nd) else ""
                         nd.last_ping_ms = int(entry.get("ping") or -1)
                         if nd.last_ping_ms > 0:
                             nd.health_status = "VERIFIED"
@@ -716,6 +789,133 @@ class AlanAutoPilotEngine:
             except Exception:
                 pass
         return []
+
+    def _sync_hidden_auto_pool(self):
+        urls = self._resolve_hidden_urls()
+        if not urls:
+            self._notify_auto_locations_updated()
+            return
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.headers.update({"User-Agent": "v2rayNG/1.9.5"})
+        if self.snapshot.is_connected:
+            px = f"http://127.0.0.1:{self.xray.active_http_port}"
+            sess.proxies = {"http": px, "https": px}
+
+        merged_nodes: List[ProfileNode] = []
+        seen_uris = set()
+        try:
+            for u in urls:
+                try:
+                    resp = sess.get(u, timeout=12.0)
+                    if resp.status_code == 200 and resp.text:
+                        for nd in self._parse_worker_pool_payload(resp.text):
+                            if nd.uri not in seen_uris:
+                                seen_uris.add(nd.uri)
+                                merged_nodes.append(nd)
+                except Exception:
+                    continue
+        finally:
+            sess.close()
+
+        if merged_nodes:
+            with self._repo_lock:
+                self.hidden_pool = merged_nodes
+            self._hydrate_hidden_pool_meta()
+            try:
+                compact = [{"u": n.uri, "c": n.country_code} for n in merged_nodes]
+                enc = base64.b64encode(json.dumps(compact, ensure_ascii=False).encode("utf-8"))
+                with open(self.hidden_cache_path, "wb") as fh:
+                    fh.write(enc)
+            except Exception:
+                pass
+            loc_items = self.get_available_auto_locations()
+            loc_count = max(0, len(loc_items) - 1)
+            self.emit_log(f"[AutoPool] Synced {len(merged_nodes)} repository endpoints across {loc_count} location(s).")
+        self._notify_auto_locations_updated()
+        self._push_telemetry()
+
+    def get_available_auto_locations(self) -> List[dict]:
+        with self._repo_lock:
+            pool_copy = list(self.hidden_pool)
+        total = len(pool_copy)
+        counts: Dict[str, int] = {}
+        for nd in pool_copy:
+            cc = (nd.country_code or "").strip().upper()
+            if not cc:
+                cc = LocationExtractor.extract_country_code(name=nd.name, uri=nd.uri)
+                nd.country_code = cc
+            if cc:
+                counts[cc] = counts.get(cc, 0) + 1
+
+        cur_pref = (self.settings.preferred_auto_location or "ALL").strip().upper()
+        if (cur_pref not in ("", "ALL", "AUTO")) and (total > 0) and (cur_pref not in counts):
+            self.settings.preferred_auto_location = "ALL"
+            self._save_settings(self.settings)
+
+        items: List[dict] = [
+            {
+                "code": "ALL",
+                "country_code": "ALL",
+                "name_fa": "همه لوکیشن‌ها (خودکار)",
+                "name_en": "All Locations (Auto)",
+                "label_fa": f"همه لوکیشن‌ها ({total})" if total > 0 else "همه لوکیشن‌ها (خودکار)",
+                "label_en": f"All Locations ({total})" if total > 0 else "All Locations (Auto)",
+                "count": total,
+            }
+        ]
+        for cc, cnt in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            en_n, fa_n = LocationExtractor.get_country_names(cc)
+            items.append({
+                "code": cc,
+                "country_code": cc,
+                "name_fa": fa_n,
+                "name_en": en_n,
+                "label_fa": f"{fa_n} ({cc}) — {cnt}",
+                "label_en": f"{en_n} ({cc}) — {cnt}",
+                "count": cnt,
+            })
+        return items
+
+    def get_selected_auto_location(self) -> str:
+        val = (self.settings.preferred_auto_location or "ALL").strip().upper()
+        return "ALL" if val in ("", "AUTO", "همه") else val
+
+    def _notify_auto_locations_updated(self):
+        locs = self.get_available_auto_locations()
+        sel_loc = self.get_selected_auto_location()
+        with self._state_lock:
+            self.snapshot.preferred_auto_location = sel_loc
+            self.snapshot.available_auto_locations = locs
+        if self.on_auto_locations is not None:
+            self.on_auto_locations(locs, sel_loc)
+
+    def set_auto_location(self, location_code: str):
+        raw_c = (location_code or "ALL").strip().upper()
+        norm_c = "ALL" if raw_c in ("", "ALL", "AUTO", "همه") else raw_c
+        available_codes = {item["code"] for item in self.get_available_auto_locations()}
+        if (norm_c != "ALL") and (len(available_codes) > 1) and (norm_c not in available_codes):
+            norm_c = "ALL"
+
+        changed = (norm_c != self.get_selected_auto_location()) or (not self.is_auto_repo_mode())
+        self.settings.preferred_auto_location = norm_c
+        self.settings.autopilot_enabled = True
+        self.settings.selected_profile_uid = "__SMART_AUTO__"
+        self.selected_index = -1
+        self._save_settings(self.settings)
+        self._notify_auto_locations_updated()
+        self._notify_settings_updated()
+        self._notify_profiles_updated(save_selection=True)
+        self._push_telemetry()
+
+        if norm_c == "ALL":
+            self.emit_log("[AutoPool] Location filter set to: ALL")
+        else:
+            en_n, _ = LocationExtractor.get_country_names(norm_c)
+            self.emit_log(f"[AutoPool] Location filter locked to: {en_n} ({norm_c})")
+
+        if changed and (self.snapshot.is_connected or self.snapshot.is_connecting):
+            self.request_connect()
 
     def _resolve_hidden_urls(self) -> List[str]:
         urls: List[str] = []
@@ -737,43 +937,6 @@ class AlanAutoPilotEngine:
             except Exception:
                 pass
         return urls
-
-    def _sync_hidden_auto_pool(self):
-        urls = self._resolve_hidden_urls()
-        if not urls:
-            return
-        sess = requests.Session()
-        sess.trust_env = False
-        sess.headers.update({"User-Agent": "v2rayNG/1.9.5"})
-        if self.snapshot.is_connected:
-            px = f"http://127.0.0.1:{self.xray.active_http_port}"
-            sess.proxies = {"http": px, "https": px}
-        collected_uris: List[str] = []
-        try:
-            for u in urls:
-                try:
-                    resp = sess.get(u, timeout=10.0)
-                    if resp.status_code == 200:
-                        for uri in UriConfigCodec.extract_uris_from_blob(resp.text):
-                            if uri not in collected_uris:
-                                collected_uris.append(uri)
-                except Exception:
-                    continue
-        finally:
-            sess.close()
-
-        if collected_uris:
-            nodes = [UriConfigCodec.extract_profile_node(u, group_tag="__AUTO_POOL__", is_hidden=True) for u in collected_uris]
-            with self._repo_lock:
-                self.hidden_pool = nodes
-            self._hydrate_hidden_pool_meta()
-            try:
-                enc = base64.b64encode("\n".join(collected_uris).encode("utf-8"))
-                with open(self.hidden_cache_path, "wb") as fh:
-                    fh.write(enc)
-            except Exception:
-                pass
-            self.emit_log(f"[AutoPool] Synced {len(nodes)} smart backup endpoints.")
 
     def get_profiles_as_dicts(self) -> List[dict]:
         return self._serialize_profiles()
@@ -948,6 +1111,9 @@ class AlanAutoPilotEngine:
             return
         if clean_key == "system_proxy_enabled":
             self.set_system_proxy(bool(value))
+            return
+        if clean_key == "preferred_auto_location":
+            self.set_auto_location(str(value))
             return
         if clean_key in ("autopilot_enabled", "auto_pool_enabled"):
             auto_on = bool(value)
@@ -1634,6 +1800,168 @@ class AlanAutoPilotEngine:
         self.select_config(nd.uid)
         self.request_connect()
 
+    def hunt_subscription_and_connect(self, sub_url_or_title: Any = "", title: str = ""):
+        if self.snapshot.is_connecting or self.snapshot.is_connected:
+            self._teardown_active_tunnel_sync()
+
+        with self._state_lock:
+            self._op_generation += 1
+            gen_id = self._op_generation
+            self._abort_flag = False
+            self._scan_abort_flag = False
+            self._task_abort_flag = False
+
+        self._set_state(
+            EngineState.HUNTING_BEST,
+            "پویش کامل اشتراک و اتصال به برترین کانفیگ...",
+            "دریافت و غربالگری موازی تمام کانفیگ‌های اشتراک",
+            progress=5,
+        )
+        self._emit_task_progress(True, 5, "آماده‌سازی پویش کامل اشتراک...")
+
+        self._worker_thread = threading.Thread(
+            target=self._run_subscription_hunt_pipeline,
+            args=(gen_id, sub_url_or_title, title),
+            daemon=True,
+        )
+        self._worker_thread.start()
+
+    def _run_subscription_hunt_pipeline(self, gen_id: int, sub_url_or_title: Any, custom_title: str = ""):
+        try:
+            target_sub: Optional[SubscriptionItem] = None
+            group_label = (custom_title or "").strip()
+
+            if isinstance(sub_url_or_title, int):
+                with self._repo_lock:
+                    if 0 <= sub_url_or_title < len(self.subscriptions):
+                        target_sub = self.subscriptions[sub_url_or_title]
+            else:
+                raw_key = str(sub_url_or_title or "").strip()
+                if raw_key.lower().startswith(("http://", "https://")):
+                    with self._repo_lock:
+                        target_sub = next((s for s in self.subscriptions if s.url == raw_key), None)
+                        if target_sub is None:
+                            auto_title = group_label or f"Sub-{len(self.subscriptions) + 1}"
+                            target_sub = SubscriptionItem(url=raw_key, title=auto_title)
+                            self.subscriptions.append(target_sub)
+                            self._save_subscriptions()
+                            self._notify_subscriptions_updated()
+                elif raw_key:
+                    with self._repo_lock:
+                        target_sub = next(
+                            (s for s in self.subscriptions if s.title.lower() == raw_key.lower() or s.url == raw_key),
+                            None,
+                        )
+                    if target_sub is None:
+                        group_label = raw_key
+                else:
+                    with self._repo_lock:
+                        if self.subscriptions:
+                            target_sub = self.subscriptions[0]
+
+            if target_sub is not None:
+                group_label = target_sub.title
+                self._set_state(
+                    EngineState.HUNTING_BEST,
+                    f"دریافت آخرین کانفیگ‌های «{group_label}»...",
+                    "بروزرسانی لینک اشتراک قبل از شروع شکار",
+                    progress=10,
+                )
+                self._pull_single_subscription(target_sub)
+
+            if self._is_op_cancelled(gen_id):
+                return
+
+            visible = self.get_visible_profiles()
+            if group_label and (group_label not in ("All", "همه")):
+                sub_nodes = [p for p in visible if p.group_tag.lower() == group_label.lower()]
+            else:
+                sub_nodes = visible
+
+            if not sub_nodes:
+                self._emit_task_progress(False, 0, "کانفیگی در این اشتراک یافت نشد")
+                self._set_state(EngineState.ERROR, "اشتراک خالی است", "هیچ کانفیگ معتبری در این لینک ساب یافت نشد", 0)
+                return
+
+            total_sub = len(sub_nodes)
+            self._set_state(
+                EngineState.HUNTING_BEST,
+                f"پینگ موازی {total_sub} کانفیگ در «{group_label or 'اشتراک'}»...",
+                "تست واقعی تونل با اولویت هاست اصلی (Origin-First)",
+                progress=22,
+            )
+
+            def _prog_ping(p_val: int, p_msg: str):
+                scaled = 22 + int((p_val / 100.0) * 42)
+                self._emit_task_progress(True, scaled, f"[{group_label}] {p_msg}")
+                self._set_state(EngineState.HUNTING_BEST, f"پویش اشتراک «{group_label}»...", p_msg, scaled)
+
+            ping_map = self.xray.batch_real_ping_and_gemini(
+                nodes=sub_nodes,
+                settings=self.settings,
+                shared_cdn_ip="",
+                check_gemini=False,
+                chunk_size=10,
+                abort_check=lambda: self._is_op_cancelled(gen_id),
+                progress_cb=_prog_ping,
+            )
+
+            if self._is_op_cancelled(gen_id):
+                return
+
+            alive_nodes: List[ProfileNode] = []
+            now_ts = int(time.time())
+            with self._repo_lock:
+                for nd in sub_nodes:
+                    rtt, _ = ping_map.get(nd.uid, (-1, "UNKNOWN"))
+                    nd.last_ping_ms = rtt
+                    nd.last_tested_ts = now_ts
+                    if rtt > 0:
+                        nd.health_status = "HEALTHY"
+                        alive_nodes.append(nd)
+                    else:
+                        nd.health_status = "DEAD"
+
+            self.sort_configs("ping")
+
+            if not alive_nodes:
+                for cand in sub_nodes[:8]:
+                    if self._is_op_cancelled(gen_id):
+                        return
+                    if self._execute_autopilot_pipeline(gen_id, cand, max_vectors=8, force_auto_vectors=True):
+                        self.select_config(cand.uid)
+                        return
+                self._emit_task_progress(False, 0, "هیچ کانفیگ فعالی در این اشتراک پاسخ نداد")
+                self._set_state(EngineState.ERROR, "کانفیگ فعالی در ساب یافت نشد", "تمام سرورهای این اشتراک بررسی شدند", 0)
+                return
+
+            alive_nodes.sort(key=lambda n: n.last_ping_ms if n.last_ping_ms > 0 else 999999)
+            for rank_i, best_cand in enumerate(alive_nodes[:6], 1):
+                if self._is_op_cancelled(gen_id):
+                    return
+                pct = 68 + int((rank_i / min(6, len(alive_nodes))) * 28)
+                self._set_state(
+                    EngineState.VERIFYING_STABILITY,
+                    f"تایید نهایی رتبه #{rank_i} اشتراک «{group_label}»...",
+                    f"کانفیگ «{best_cand.name}» ({best_cand.last_ping_ms}ms)",
+                    progress=pct,
+                )
+                if self._execute_autopilot_pipeline(gen_id, best_cand, max_vectors=10, force_auto_vectors=True):
+                    self.settings.autopilot_enabled = False
+                    self.settings.selected_profile_uid = best_cand.uid
+                    self._save_settings(self.settings)
+                    self._notify_settings_updated()
+                    self._notify_profiles_updated(save_selection=True)
+                    self.emit_log(f"[SubHunter] Connected to #1 config in '{group_label}': {best_cand.name} ({best_cand.last_ping_ms}ms)")
+                    return
+
+            self._emit_task_progress(False, 0, "پایداری استریم روی کاندیدهای ساب تایید نشد")
+            self._set_state(EngineState.ERROR, "اتصال پایدار برقرار نشد", "سرورهای ساب پینگ دادند اما استریم را عبور ندادند", 0)
+        except Exception as exc:
+            self.emit_log(f"[SubHunter] Error: {exc}")
+            if not self._is_op_cancelled(gen_id):
+                self._set_state(EngineState.ERROR, "خطا در پویش اشتراک", str(exc), 0)
+
     def hunt_best_and_connect(self):
         visible = self.get_visible_profiles()
         if (not visible) and (not self.hidden_pool):
@@ -1669,62 +1997,62 @@ class AlanAutoPilotEngine:
 
     def _run_hunt_best_pipeline(self, gen_id: int):
         try:
+            loc_code = "ALL"
             if self.is_auto_repo_mode():
                 if not self.hidden_pool:
                     self._sync_hidden_auto_pool()
-                with self._repo_lock:
-                    pool_raw = list(self.hidden_pool)
-                verified_h = [n for n in pool_raw if n.health_status == "VERIFIED"]
-                others_h = [n for n in pool_raw if n.health_status != "VERIFIED"]
+                pool_filtered, loc_code = self._filter_hidden_pool_by_location()
+                verified_h = [n for n in pool_filtered if n.health_status == "VERIFIED"]
+                others_h = [n for n in pool_filtered if n.health_status != "VERIFIED"]
                 random.shuffle(others_h)
                 all_nodes = verified_h + others_h[:96]
             else:
                 all_nodes = self.get_visible_profiles()
+
             total_nodes = len(all_nodes)
             if total_nodes == 0:
-                self._set_state(EngineState.ERROR, "مخزن خالی است", "کانفیگی برای شکار یافت نشد", 0)
+                if loc_code != "ALL":
+                    _, fa_n = LocationExtractor.get_country_names(loc_code)
+                    self._set_state(EngineState.ERROR, f"سروری برای {fa_n} ({loc_code}) یافت نشد", "لوکیشن دیگری انتخاب کنید", 0)
+                else:
+                    self._set_state(EngineState.ERROR, "مخزن خالی است", "کانفیگی برای شکار یافت نشد", 0)
                 return
 
-            port_edge_cache: Dict[int, List[str]] = {}
-            cdn_ports = sorted({nd.port for nd in all_nodes if CleanIpScanner.is_cdn_eligible(nd)})
-            if self.settings.auto_clean_ip and cdn_ports:
-                self._set_state(EngineState.HUNTING_BEST, "شکار برترین کانفیگ...", "کشف لبه‌های تمیز CDN...", 12)
-                for p_num in cdn_ports[:3]:
-                    if self._is_op_cancelled(gen_id):
-                        return
-                    edges = CleanIpScanner.discover_best_ips(
-                        port=p_num,
-                        top_n=2,
-                        sample_count=32,
-                        log_fn=self.emit_log,
-                        abort_check=lambda: self._is_op_cancelled(gen_id),
-                    )
-                    if edges:
-                        port_edge_cache[p_num] = [ip for ip, _ in edges]
+            loc_title = ""
+            if loc_code != "ALL":
+                _, fa_loc = LocationExtractor.get_country_names(loc_code)
+                loc_title = f" [{fa_loc} • {loc_code}]"
 
-            if self._is_op_cancelled(gen_id):
-                return
-
-            self._set_state(EngineState.HUNTING_BEST, "پالایش سرعت مخزن...", f"بررسی موازی {total_nodes} کانفیگ", 26)
-            self._emit_task_progress(True, 26, f"غربالگری موازی TCP روی {total_nodes} کانفیگ...")
+            self._set_state(EngineState.HUNTING_BEST, f"پالایش سرورها{loc_title}...", f"بررسی مستقیم هاست اصلی روی {total_nodes} سرور", 18)
+            self._emit_task_progress(True, 18, f"غربالگری مستقیم هاست اصلی روی {total_nodes} سرور{loc_title}...")
 
             def _fast_eval(nd: ProfileNode):
-                if CleanIpScanner.is_cdn_eligible(nd) and (nd.port in port_edge_cache):
-                    ep = port_edge_cache[nd.port][0]
-                else:
-                    ep = nd.cached_clean_ip or CleanIpScanner.resolve_unpoisoned_ipv4(nd.original_host, timeout=1.5)
-                ms = CleanIpScanner.fast_tcp_ping(ep, nd.port, timeout=1.5)
-                return ms, nd, ep
+                if not CleanIpScanner.is_cdn_eligible(nd):
+                    nd.cached_clean_ip = ""
+                orig_ep = self._resolve_origin_endpoint(nd)
+                if orig_ep:
+                    ms = CleanIpScanner.fast_tcp_ping(orig_ep, nd.port, timeout=1.5)
+                    if ms >= 0:
+                        return ms, nd, orig_ep
+                if nd.cached_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
+                    ms_c = CleanIpScanner.fast_tcp_ping(nd.cached_clean_ip, nd.port, timeout=1.4)
+                    if ms_c >= 0:
+                        return ms_c, nd, nd.cached_clean_ip
+                return -1, nd, ""
 
             prior_verified: List[Tuple[int, ProfileNode, str]] = []
             foreign_candidates: List[Tuple[int, ProfileNode, str]] = []
             domestic_candidates: List[Tuple[int, ProfileNode, str]] = []
+            blocked_cdn_nodes: List[ProfileNode] = []
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=16) as pool:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=18) as pool:
                 for ms, nd, ep in pool.map(_fast_eval, all_nodes):
                     if ms < 0:
-                        nd.health_status = "DEAD"
-                        nd.last_ping_ms = -1
+                        if self.settings.auto_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
+                            blocked_cdn_nodes.append(nd)
+                        else:
+                            nd.health_status = "DEAD"
+                            nd.last_ping_ms = -1
                         continue
                     if (nd.health_status == "VERIFIED") or bool(nd.cached_vector_id):
                         prior_verified.append((ms, nd, ep))
@@ -1742,14 +2070,21 @@ class AlanAutoPilotEngine:
 
             shortlist: List[Tuple[int, ProfileNode, str]] = []
             shortlist.extend(prior_verified[:5])
-            shortlist.extend(foreign_candidates[:7])
-            shortlist.extend(domestic_candidates[:5])
+            shortlist.extend(foreign_candidates[:8])
+            shortlist.extend(domestic_candidates[:4])
+
+            port_edge_cache: Dict[int, List[str]] = {}
+            if (len(shortlist) < 4) and blocked_cdn_nodes and self.settings.auto_clean_ip:
+                for cdn_nd in blocked_cdn_nodes[:6]:
+                    if self._is_op_cancelled(gen_id):
+                        return
+                    fb_ips = self._discover_fallback_clean_ips(cdn_nd, gen_id, port_edge_cache=port_edge_cache, sample_count=28)
+                    if fb_ips:
+                        shortlist.append((250, cdn_nd, fb_ips[0]))
 
             if not shortlist:
-                self._save_profiles(self.profiles)
-                self._notify_profiles_updated()
-                self._emit_task_progress(False, 0, "هیچ کانفیگ در دسترسی یافت نشد")
-                self._set_state(EngineState.ERROR, "کانفیگ فعالی یافت نشد", "سرورهای موجود پاسخ نمی‌دهند", 0)
+                self._emit_task_progress(False, 0, "هیچ سرور در دسترسی یافت نشد")
+                self._set_state(EngineState.ERROR, f"سرور فعالی یافت نشد{loc_title}", "لوکیشن دیگر یا اتصال اینترنت را بررسی کنید", 0)
                 return
 
             qualified_winners: List[Tuple[int, float, ProfileNode, str, BypassVector]] = []
@@ -1765,49 +2100,68 @@ class AlanAutoPilotEngine:
                     continue
 
                 node_plan = self._build_vector_plan(cand_node, self.settings.engine_mode)
-                probe_vecs = node_plan[:3] if CleanIpScanner.is_domestic_or_direct_tunnel(cand_node) else node_plan[:6]
+                probe_vecs = node_plan[:3] if CleanIpScanner.is_domestic_or_direct_tunnel(cand_node) else node_plan[:5]
 
-                for v_i, vec in enumerate(probe_vecs):
+                endpoints_for_cand = [cand_ep]
+                cand_connected = False
+
+                for stage_idx in range(2):
                     if self._is_op_cancelled(gen_id):
                         return
-                    pct = 32 + int(((c_idx - 1 + ((v_i + 1) / max(1, len(probe_vecs)))) / total_short) * 60)
-                    disp_name = "Smart Auto-Server" if cand_node.is_hidden_pool else cand_node.name
-                    msg = f"[{c_idx}/{total_short}] تست «{disp_name}» با {vec.vector_id}..."
-                    self._set_state(EngineState.HUNTING_BEST, "شکار برترین کانفیگ...", msg, pct)
-                    self._emit_task_progress(True, pct, msg)
+                    if stage_idx == 1:
+                        if cand_connected or (not self.settings.auto_clean_ip) or (not CleanIpScanner.is_cdn_eligible(cand_node)):
+                            break
+                        fb_ips = self._discover_fallback_clean_ips(cand_node, gen_id, port_edge_cache=port_edge_cache, sample_count=28)
+                        fb_ips = [ip for ip in fb_ips if ip not in endpoints_for_cand]
+                        if not fb_ips:
+                            break
+                        active_ep = fb_ips[0]
+                    else:
+                        active_ep = cand_ep
 
-                    self.bridge.update_route(
-                        remote_host=cand_ep,
-                        remote_port=cand_node.port,
-                        vector=vec,
-                        custom_stride=self.settings.forward_stride_bytes,
-                        jitter_bytes=self.settings.stride_jitter_bytes,
-                        raw_passthrough=(vec.family == "DIRECT"),
-                        flush_existing_pool=True,
-                    )
+                    for v_i, vec in enumerate(probe_vecs):
+                        if self._is_op_cancelled(gen_id):
+                            return
+                        pct = 30 + int(((c_idx - 1 + ((v_i + 1) / max(1, len(probe_vecs)))) / total_short) * 62)
+                        disp_name = f"Auto-Server ({cand_node.country_code or 'GLOBAL'})" if cand_node.is_hidden_pool else cand_node.name
+                        msg = f"[{c_idx}/{total_short}] تست «{disp_name}» با {vec.vector_id}..."
+                        self._set_state(EngineState.HUNTING_BEST, f"شکار بهترین مسیر{loc_title}...", msg, pct)
+                        self._emit_task_progress(True, pct, msg)
 
-                    q_ok, q_ms, _ = self._probe_fast_tuple(http_port=self.xray.active_http_port, timeout=4.0)
-                    if self._is_op_cancelled(gen_id):
-                        return
-                    if not q_ok:
-                        continue
+                        self.bridge.update_route(
+                            remote_host=active_ep,
+                            remote_port=cand_node.port,
+                            vector=vec,
+                            custom_stride=self.settings.forward_stride_bytes,
+                            jitter_bytes=self.settings.stride_jitter_bytes,
+                            raw_passthrough=(vec.family == "DIRECT"),
+                            flush_existing_pool=True,
+                        )
 
-                    cand_node.last_ping_ms = q_ms
-                    cand_node.health_status = "HEALTHY"
-                    soft_winners.append((q_ms, 0.0, cand_node, cand_ep, vec))
+                        q_ok, q_ms, _ = self._probe_fast_tuple(http_port=self.xray.active_http_port, timeout=3.8)
+                        if self._is_op_cancelled(gen_id):
+                            return
+                        if not q_ok:
+                            continue
 
-                    f_ok, f_ms, f_up, _ = self._probe_full_tuple(
-                        http_port=self.xray.active_http_port,
-                        verify_upload=self.settings.verify_upload_stream,
-                        require_youtube_6s=self.settings.require_youtube_6s,
-                        abort_check=lambda: self._is_op_cancelled(gen_id),
-                    )
-                    if self._is_op_cancelled(gen_id):
-                        return
-                    if f_ok:
-                        qualified_winners.append((f_ms, f_up, cand_node, cand_ep, vec))
+                        cand_connected = True
+                        cand_node.last_ping_ms = q_ms
+                        cand_node.health_status = "HEALTHY"
+                        soft_winners.append((q_ms, 0.0, cand_node, active_ep, vec))
+
+                        f_ok, f_ms, f_up, _ = self._probe_full_tuple(
+                            http_port=self.xray.active_http_port,
+                            verify_upload=self.settings.verify_upload_stream,
+                            require_youtube_6s=self.settings.require_youtube_6s,
+                            abort_check=lambda: self._is_op_cancelled(gen_id),
+                        )
+                        if self._is_op_cancelled(gen_id):
+                            return
+                        if f_ok:
+                            qualified_winners.append((f_ms, f_up, cand_node, active_ep, vec))
+                            break
+                    if qualified_winners:
                         break
-
                 if qualified_winners:
                     break
 
@@ -1834,8 +2188,8 @@ class AlanAutoPilotEngine:
                     self.sort_configs("ping")
                     self.select_config(win_node.uid)
 
-                disp = "Smart Auto-Server" if win_node.is_hidden_pool else win_node.name
-                self._emit_task_progress(False, 100, f"برترین مسیر متصل شد: «{disp}» ({win_ms}ms • {win_vec.vector_id})")
+                disp = f"Smart Auto ({win_node.country_code or 'GLOBAL'})" if win_node.is_hidden_pool else win_node.name
+                self._emit_task_progress(False, 100, f"متصل شد: «{disp}» ({win_ms}ms • {win_vec.vector_id})")
                 self._lock_winning_tunnel(
                     gen_id=gen_id,
                     node=win_node,
@@ -1848,11 +2202,11 @@ class AlanAutoPilotEngine:
                 return
 
             self.xray.stop()
-            self._emit_task_progress(False, 0, "هیچ کانفیگ پایداری پاسخ نداد")
-            self._set_state(EngineState.ERROR, "شکار ناموفق بود", "هیچ‌یک از کانفیگ‌ها تونل پایدار باز نکردند", 0)
+            self._emit_task_progress(False, 0, "هیچ سرور پایداری پاسخ نداد")
+            self._set_state(EngineState.ERROR, f"اتصال ناموفق بود{loc_title}", "سرورهای کاندید تونل پایدار باز نکردند", 0)
         except Exception as exc:
             self.emit_log(f"[Hunter] Unexpected error: {exc}")
-            self._emit_task_progress(False, 0, f"خطا در شکار مخزن: {exc}")
+            self._emit_task_progress(False, 0, f"خطا در پویش مخزن: {exc}")
             if not self._is_op_cancelled(gen_id):
                 self._set_state(EngineState.ERROR, "خطا در پویش مخزن", str(exc), 0)
 
@@ -2064,20 +2418,10 @@ class AlanAutoPilotEngine:
                 if self._is_op_cancelled(gen_id):
                     break
 
-                self._emit_scan_progress(
-                    min(95, max(5, int((step_done / total_steps) * 100))),
-                    f"آماده‌سازی لبه شبکه برای «{nd.name[:24]}» (پورت {nd.port})...",
-                )
-                candidate_eps = self._resolve_candidate_endpoints(
-                    node=nd,
-                    gen_id=gen_id,
-                    port_edge_cache=port_edge_cache,
-                    sample_count=36,
-                )
-                if not candidate_eps:
-                    step_done += len(vec_pool)
-                    continue
+                if not CleanIpScanner.is_cdn_eligible(nd):
+                    nd.cached_clean_ip = ""
 
+                orig_ep = self._resolve_origin_endpoint(nd)
                 try:
                     _, lab_http = lab_xray.ensure_running(
                         uri=nd.uri,
@@ -2090,20 +2434,38 @@ class AlanAutoPilotEngine:
                     step_done += len(vec_pool)
                     continue
 
-                node_vecs = [find_vector("VEC-00")] if (nd.protocol.upper() == "SHADOWSOCKS") else vec_pool
+                node_vecs = [find_vector("VEC-00")] if (nd.protocol.upper() in ("SHADOWSOCKS", "SOCKS")) else vec_pool
                 best_for_node: Optional[Tuple[int, float, BypassVector, str, str]] = None
 
-                for ep_idx, ep_host in enumerate(candidate_eps[:2]):
+                stage_endpoints: List[str] = []
+                if orig_ep and (CleanIpScanner.fast_tcp_ping(orig_ep, nd.port, timeout=1.6) >= 0):
+                    stage_endpoints.append(orig_ep)
+
+                for stage_idx in range(2):
                     if self._is_op_cancelled(gen_id):
                         break
-                    if CleanIpScanner.fast_tcp_ping(ep_host, nd.port, timeout=1.5) < 0:
-                        continue
+                    if stage_idx == 0:
+                        if not stage_endpoints:
+                            continue
+                        ep_host = stage_endpoints[0]
+                        ep_vecs = node_vecs
+                    else:
+                        if (best_for_node is not None) or (not self.settings.auto_clean_ip) or (not CleanIpScanner.is_cdn_eligible(nd)):
+                            break
+                        self.emit_log(f"[Lab] Direct host blocked on '{nd.name}' -> Trying Clean IP fallback...")
+                        fb_ips = self._discover_fallback_clean_ips(nd, gen_id, port_edge_cache=port_edge_cache, sample_count=30)
+                        fb_ips = [ip for ip in fb_ips if ip not in stage_endpoints]
+                        if not fb_ips:
+                            break
+                        ep_host = fb_ips[0]
+                        if CleanIpScanner.fast_tcp_ping(ep_host, nd.port, timeout=1.5) < 0:
+                            break
+                        ep_vecs = node_vecs[:6] if (len(node_vecs) > 6) else node_vecs
 
-                    ep_vecs = node_vecs if (ep_idx == 0) else node_vecs[:4]
                     for vec in ep_vecs:
                         if self._is_op_cancelled(gen_id):
                             break
-                        if ep_idx == 0:
+                        if stage_idx == 0:
                             step_done += 1
                         pct = min(98, max(8, int((step_done / total_steps) * 100)))
                         self._emit_scan_progress(pct, f"آزمایشگاه: {nd.name[:24]} • {vec.vector_id} @ {ep_host}")
@@ -2167,17 +2529,17 @@ class AlanAutoPilotEngine:
                         if len(targets) > 1:
                             break
 
-                    if best_for_node is not None:
-                        break
-
                 if best_for_node is not None:
                     b_ms, b_up, b_vec, b_gem, b_ep = best_for_node
                     nd.cached_vector_id = b_vec.vector_id
-                    if CleanIpScanner.is_cdn_eligible(nd) and (b_ep != nd.original_host):
+                    if b_ep in (nd.original_host, orig_ep):
+                        nd.cached_clean_ip = ""
+                    elif CleanIpScanner.is_cdn_eligible(nd):
                         nd.cached_clean_ip = b_ep
                     nd.last_ping_ms = b_ms
                     nd.upload_kbps = b_up
-                    nd.gemini_status = b_gem
+                    if b_gem:
+                        nd.gemini_status = b_gem
                     nd.health_status = "VERIFIED"
                     nd.last_tested_ts = int(time.time())
                     self._promote_node_to_verified_outputs(nd, b_vec, b_ep, b_ms, b_up)
@@ -2202,12 +2564,21 @@ class AlanAutoPilotEngine:
             lab_xray.stop()
             lab_bridge.stop()
 
-    def _run_active_profile_matrix_scan(self, gen_id: int, idx: int, auto_connect: bool, check_gemini: bool = False, single_vector_id: Optional[str] = None):
+    def _run_active_profile_matrix_scan(
+        self,
+        gen_id: int,
+        idx: int,
+        auto_connect: bool,
+        check_gemini: bool = False,
+        single_vector_id: Optional[str] = None,
+    ):
         visible = self.get_visible_profiles()
         if not (0 <= idx < len(visible)):
             self._emit_scan_state(False, "پروفایل معتبری در مخزن انتخاب نشده است")
             return
         node = visible[idx]
+        if not CleanIpScanner.is_cdn_eligible(node):
+            node.cached_clean_ip = ""
 
         lab_settings = EngineSettings.from_dict(self.settings.to_dict())
         lab_settings.socks_port = 22818
@@ -2228,37 +2599,35 @@ class AlanAutoPilotEngine:
                 is_probe_mode=True,
             )
 
-            self._emit_scan_progress(12, f"کشف بهترین لبه شبکه روی پورت {node.port}...")
-            candidate_eps = self._resolve_candidate_endpoints(node=node, gen_id=gen_id, sample_count=38)
-            endpoint = candidate_eps[0] if candidate_eps else node.original_host
+            orig_ep = self._resolve_origin_endpoint(node)
+            orig_tcp_ms = CleanIpScanner.fast_tcp_ping(orig_ep, node.port, timeout=1.7) if orig_ep else -1
+            can_fallback_cdn = bool(self.settings.auto_clean_ip) and CleanIpScanner.is_cdn_eligible(node)
+
+            if orig_tcp_ms >= 0:
+                active_endpoint = orig_ep
+            elif can_fallback_cdn:
+                self._emit_scan_progress(12, f"هاست اصلی مسدود است — جستجوی IP تمیز جایگزین روی پورت {node.port}...")
+                fb_ips = self._discover_fallback_clean_ips(node=node, gen_id=gen_id, sample_count=36)
+                active_endpoint = fb_ips[0] if fb_ips else (orig_ep or node.original_host)
+            else:
+                active_endpoint = orig_ep or node.original_host
 
             vectors = [find_vector(single_vector_id)] if single_vector_id else self._build_vector_plan(node, self.settings.engine_mode)
             evaluated_rows: List[dict] = []
             passing_results: List[Tuple[int, int, float, BypassVector, str]] = []
+            cached_lab_gem: Optional[str] = None
 
-            for v_idx, vec in enumerate(vectors, 1):
-                if self._is_op_cancelled(gen_id):
-                    return
-                pct = 18 + int((v_idx / max(1, len(vectors))) * 78)
-                self._emit_scan_progress(pct, f"[{v_idx}/{len(vectors)}] آزمایش {vec.vector_id} ({vec.code_name})...")
+            def _evaluate_vectors_on_endpoint(ep_target: str, vec_seq: List[BypassVector], allow_early_gate: bool) -> bool:
+                nonlocal cached_lab_gem
+                gate_limit = min(3, len(vec_seq))
+                for v_idx, vec in enumerate(vec_seq, 1):
+                    if self._is_op_cancelled(gen_id):
+                        return False
+                    pct = 16 + int((v_idx / max(1, len(vec_seq))) * 80)
+                    self._emit_scan_progress(pct, f"[{v_idx}/{len(vec_seq)}] آزمایش {vec.vector_id} ({vec.code_name}) @ {ep_target}...")
 
-                lab_bridge.update_route(
-                    remote_host=endpoint,
-                    remote_port=node.port,
-                    vector=vec,
-                    custom_stride=self.settings.forward_stride_bytes,
-                    jitter_bytes=self.settings.stride_jitter_bytes,
-                    raw_passthrough=(vec.family == "DIRECT"),
-                    flush_existing_pool=True,
-                )
-
-                tcp_ms = CleanIpScanner.fast_tcp_ping(endpoint, node.port, timeout=1.5)
-                q_ok, q_ms, q_detail = self._probe_fast_tuple(http_port=lab_http, timeout=4.2)
-
-                if (not q_ok) and (v_idx == 2) and (not passing_results) and (len(candidate_eps) > 1):
-                    endpoint = candidate_eps[1]
                     lab_bridge.update_route(
-                        remote_host=endpoint,
+                        remote_host=ep_target,
                         remote_port=node.port,
                         vector=vec,
                         custom_stride=self.settings.forward_stride_bytes,
@@ -2266,102 +2635,122 @@ class AlanAutoPilotEngine:
                         raw_passthrough=(vec.family == "DIRECT"),
                         flush_existing_pool=True,
                     )
+
+                    tcp_ms = CleanIpScanner.fast_tcp_ping(ep_target, node.port, timeout=1.5)
                     q_ok, q_ms, q_detail = self._probe_fast_tuple(http_port=lab_http, timeout=4.2)
+                    if self._is_op_cancelled(gen_id):
+                        return False
 
-                if self._is_op_cancelled(gen_id):
-                    return
+                    if not q_ok:
+                        if allow_early_gate and (v_idx == gate_limit) and (not passing_results):
+                            return False
+                        row = {
+                            "scan_type": "vector",
+                            "rank": 99,
+                            "target_index": idx,
+                            "uid": node.uid,
+                            "item_id": vec.vector_id,
+                            "bound_vector": vec.vector_id,
+                            "title": f"{vec.vector_id} • {vec.code_name}",
+                            "profile_name": node.name,
+                            "vector_name": vec.code_name,
+                            "category": vec.family,
+                            "endpoint": f"{ep_target}:{node.port}",
+                            "tcp_ms": tcp_ms,
+                            "tunnel_ms": -1,
+                            "status": "BLOCKED",
+                            "score": 0,
+                            "detail": q_detail,
+                        }
+                        evaluated_rows.append(row)
+                        self._emit_scan_row(row)
+                        continue
 
-                if not q_ok:
-                    row = {
-                        "scan_type": "vector",
-                        "rank": 99,
-                        "target_index": idx,
-                        "uid": node.uid,
-                        "item_id": vec.vector_id,
-                        "bound_vector": vec.vector_id,
-                        "title": f"{vec.vector_id} • {vec.code_name}",
-                        "profile_name": node.name,
-                        "vector_name": vec.code_name,
-                        "category": vec.family,
-                        "endpoint": f"{endpoint}:{node.port}",
-                        "tcp_ms": tcp_ms,
-                        "tunnel_ms": -1,
-                        "status": "BLOCKED",
-                        "score": 0,
-                        "detail": q_detail,
-                    }
-                    evaluated_rows.append(row)
-                    self._emit_scan_row(row)
-                    continue
+                    f_ok, f_ms, f_up, f_detail = self._probe_full_tuple(
+                        http_port=lab_http,
+                        verify_upload=self.settings.verify_upload_stream,
+                        require_youtube_6s=self.settings.require_youtube_6s,
+                        abort_check=lambda: self._is_op_cancelled(gen_id),
+                    )
+                    if self._is_op_cancelled(gen_id):
+                        return False
 
-                f_ok, f_ms, f_up, f_detail = self._probe_full_tuple(
-                    http_port=lab_http,
-                    verify_upload=self.settings.verify_upload_stream,
-                    require_youtube_6s=self.settings.require_youtube_6s,
-                    abort_check=lambda: self._is_op_cancelled(gen_id),
-                )
-                if self._is_op_cancelled(gen_id):
-                    return
+                    if f_ok:
+                        if check_gemini:
+                            if cached_lab_gem is None:
+                                g_ok, _ = TunnelStreamVerifier.check_gemini_access(lab_http, timeout=5.0)
+                                cached_lab_gem = "OK" if g_ok else "BLOCKED"
+                            gem_stat = cached_lab_gem
+                            node.gemini_status = gem_stat
+                        else:
+                            gem_stat = "OK" if (node.gemini_status == "OK") else ""
 
-                if f_ok:
-                    if check_gemini:
-                        if "_cached_lab_gem" not in locals():
-                            g_ok, _ = TunnelStreamVerifier.check_gemini_access(lab_http, timeout=5.0)
-                            _cached_lab_gem = "OK" if g_ok else "BLOCKED"
-                        gem_stat = _cached_lab_gem
-                        node.gemini_status = gem_stat
+                        score = max(35, min(100, int(100 - (f_ms // 22) + min(15.0, f_up / 20.0))))
+                        row = {
+                            "scan_type": "vector",
+                            "rank": 1,
+                            "target_index": idx,
+                            "uid": node.uid,
+                            "item_id": vec.vector_id,
+                            "bound_vector": vec.vector_id,
+                            "title": f"{vec.vector_id} • {vec.code_name}",
+                            "profile_name": node.name,
+                            "vector_name": vec.code_name,
+                            "category": vec.family,
+                            "endpoint": f"{ep_target}:{node.port}",
+                            "tcp_ms": tcp_ms,
+                            "tunnel_ms": f_ms,
+                            "upload_kbps": f_up,
+                            "gemini_status": gem_stat,
+                            "gemini_ok": gem_stat == "OK",
+                            "status": "VERIFIED",
+                            "score": score,
+                            "detail": f"Up={f_up:.0f} KB/s | {f_detail}",
+                        }
+                        evaluated_rows.append(row)
+                        self._emit_scan_row(row)
+                        passing_results.append((-score, f_ms, f_up, vec, ep_target))
+                        if auto_connect:
+                            return True
                     else:
-                        gem_stat = "OK" if (node.gemini_status == "OK") else ""
-                    score = max(35, min(100, int(100 - (f_ms // 22) + min(15.0, f_up / 20.0))))
-                    row = {
-                        "scan_type": "vector",
-                        "rank": 1,
-                        "target_index": idx,
-                        "uid": node.uid,
-                        "item_id": vec.vector_id,
-                        "bound_vector": vec.vector_id,
-                        "title": f"{vec.vector_id} • {vec.code_name}",
-                        "profile_name": node.name,
-                        "vector_name": vec.code_name,
-                        "category": vec.family,
-                        "endpoint": f"{endpoint}:{node.port}",
-                        "tcp_ms": tcp_ms,
-                        "tunnel_ms": f_ms,
-                        "upload_kbps": f_up,
-                        "gemini_status": gem_stat,
-                        "gemini_ok": gem_stat == "OK",
-                        "status": "VERIFIED",
-                        "score": score,
-                        "detail": f"Up={f_up:.0f} KB/s | {f_detail}",
-                    }
-                    evaluated_rows.append(row)
-                    self._emit_scan_row(row)
-                    passing_results.append((-score, f_ms, f_up, vec, endpoint))
-                    if auto_connect:
-                        break
-                else:
-                    partial_score = max(15, 50 - (q_ms // 35))
-                    row = {
-                        "scan_type": "vector",
-                        "rank": 50,
-                        "target_index": idx,
-                        "uid": node.uid,
-                        "item_id": vec.vector_id,
-                        "bound_vector": vec.vector_id,
-                        "title": f"{vec.vector_id} • {vec.code_name}",
-                        "profile_name": node.name,
-                        "vector_name": vec.code_name,
-                        "category": vec.family,
-                        "endpoint": f"{endpoint}:{node.port}",
-                        "tcp_ms": tcp_ms,
-                        "tunnel_ms": q_ms,
-                        "status": "PARTIAL_OK",
-                        "score": partial_score,
-                        "detail": f"Initial {q_ms}ms OK ({f_detail})",
-                    }
-                    evaluated_rows.append(row)
-                    self._emit_scan_row(row)
-                    passing_results.append((-partial_score, q_ms, 0.0, vec, endpoint))
+                        partial_score = max(15, 50 - (q_ms // 35))
+                        row = {
+                            "scan_type": "vector",
+                            "rank": 50,
+                            "target_index": idx,
+                            "uid": node.uid,
+                            "item_id": vec.vector_id,
+                            "bound_vector": vec.vector_id,
+                            "title": f"{vec.vector_id} • {vec.code_name}",
+                            "profile_name": node.name,
+                            "vector_name": vec.code_name,
+                            "category": vec.family,
+                            "endpoint": f"{ep_target}:{node.port}",
+                            "tcp_ms": tcp_ms,
+                            "tunnel_ms": q_ms,
+                            "status": "PARTIAL_OK",
+                            "score": partial_score,
+                            "detail": f"Initial {q_ms}ms OK ({f_detail})",
+                        }
+                        evaluated_rows.append(row)
+                        self._emit_scan_row(row)
+                        passing_results.append((-partial_score, q_ms, 0.0, vec, ep_target))
+                return bool(passing_results)
+
+            used_origin_with_cdn_gate = (active_endpoint == orig_ep) and can_fallback_cdn
+            origin_ok = _evaluate_vectors_on_endpoint(active_endpoint, vectors, allow_early_gate=used_origin_with_cdn_gate)
+
+            if (not origin_ok) and used_origin_with_cdn_gate and (not self._is_op_cancelled(gen_id)):
+                self.emit_log(f"[Lab] Direct host '{orig_ep}' blocked -> Falling back to Clean IP scan...")
+                self._emit_scan_progress(15, f"هاست اصلی مسدود است — جستجوی IP تمیز جایگزین روی پورت {node.port}...")
+                fb_ips = self._discover_fallback_clean_ips(node=node, gen_id=gen_id, sample_count=36)
+                fb_ips = [ip for ip in fb_ips if ip != orig_ep]
+                if fb_ips:
+                    evaluated_rows.clear()
+                    _evaluate_vectors_on_endpoint(fb_ips[0], vectors, allow_early_gate=False)
+
+            if self._is_op_cancelled(gen_id):
+                return
 
             evaluated_rows.sort(
                 key=lambda r: (
@@ -2378,7 +2767,9 @@ class AlanAutoPilotEngine:
                 passing_results.sort(key=lambda x: (x[0], x[1]))
                 _, best_ms, best_up, best_vec, win_ep = passing_results[0]
                 node.cached_vector_id = best_vec.vector_id
-                if CleanIpScanner.is_cdn_eligible(node) and (win_ep != node.original_host):
+                if win_ep in (node.original_host, orig_ep):
+                    node.cached_clean_ip = ""
+                elif CleanIpScanner.is_cdn_eligible(node):
                     node.cached_clean_ip = win_ep
                 node.last_ping_ms = best_ms
                 node.upload_kbps = best_up
@@ -2442,6 +2833,9 @@ class AlanAutoPilotEngine:
             return
 
         clean_uri = uri.strip() if isinstance(uri, str) else ""
+        if clean_uri.lower().startswith(("http://", "https://")):
+            self.hunt_subscription_and_connect(clean_uri)
+            return
         if clean_uri:
             with self._repo_lock:
                 matched = next((p for p in self.profiles if (not p.is_hidden_pool) and (p.uri == clean_uri)), None)
@@ -2517,14 +2911,36 @@ class AlanAutoPilotEngine:
                 0,
             )
 
+    def _filter_hidden_pool_by_location(self) -> Tuple[List[ProfileNode], str]:
+        loc_code = self.get_selected_auto_location()
+        with self._repo_lock:
+            pool_raw = list(self.hidden_pool)
+        if loc_code == "ALL":
+            return pool_raw, "ALL"
+        filtered = [n for n in pool_raw if (n.country_code or "").upper() == loc_code]
+        return filtered, loc_code
+
     def _run_auto_repository_only_connect(self, gen_id: int):
         if not self.hidden_pool:
             self._sync_hidden_auto_pool()
-        with self._repo_lock:
-            repo_nodes = list(self.hidden_pool)
+        repo_nodes, loc_code = self._filter_hidden_pool_by_location()
 
         if not repo_nodes:
-            self._set_state(EngineState.ERROR, "مخزن خودکار در دسترس نیست", "عدم دریافت سرورهای خودکار؛ اتصال اینترنت را بررسی کنید", 0)
+            if loc_code != "ALL" and self.hidden_pool:
+                _, fa_n = LocationExtractor.get_country_names(loc_code)
+                self._set_state(
+                    EngineState.ERROR,
+                    f"لوکیشن {fa_n} ({loc_code}) در مخزن یافت نشد",
+                    "لوکیشن دیگری انتخاب کنید یا روی «همه لوکیشن‌ها» بگذارید",
+                    0,
+                )
+            else:
+                self._set_state(
+                    EngineState.ERROR,
+                    "مخزن خودکار در دسترس نیست",
+                    "عدم دریافت سرورهای خودکار؛ اتصال اینترنت را بررسی کنید",
+                    0,
+                )
             return
 
         prior_winners = [n for n in repo_nodes if (n.health_status == "VERIFIED") and n.cached_vector_id]
@@ -2586,19 +3002,22 @@ class AlanAutoPilotEngine:
 
     def _execute_autopilot_pipeline(self, gen_id: int, node: ProfileNode, max_vectors: int = 12, force_auto_vectors: bool = True) -> bool:
         try:
+            if not CleanIpScanner.is_cdn_eligible(node):
+                node.cached_clean_ip = ""
+
             self.bridge.refresh_physical_interface(enable_tun_bind=False)
             self.bridge.reset_counters()
             self._prev_tx_bytes = 0
             self._prev_rx_bytes = 0
 
-            disp_name = "Alan Smart Auto-Server" if node.is_hidden_pool else node.name
+            disp_name = f"Alan Smart Auto ({node.country_code or 'GLOBAL'})" if node.is_hidden_pool else node.name
             self.snapshot.active_profile_uid = "__SMART_AUTO__" if node.is_hidden_pool else node.uid
             self.snapshot.active_profile_name = disp_name
             self.snapshot.protocol_label = node.protocol
 
             use_native_xray_frag = bool(self.settings.fragment_enabled and (not self.settings.autopilot_enabled))
-            resolved_orig_ip = CleanIpScanner.resolve_unpoisoned_ipv4(node.original_host, timeout=1.6)
-            initial_ep = node.cached_clean_ip or resolved_orig_ip or node.original_host
+            orig_ep = self._resolve_origin_endpoint(node)
+            initial_ep = orig_ep or node.cached_clean_ip or node.original_host
 
             try:
                 self.xray.ensure_running(
@@ -2648,80 +3067,23 @@ class AlanAutoPilotEngine:
                 return False
 
             soft_winners: List[Tuple[int, str, BypassVector]] = []
+            vectors_all = self._build_vector_plan(node, self.settings.engine_mode)[:max_vectors]
+            can_cdn_fallback = bool(self.settings.auto_clean_ip) and CleanIpScanner.is_cdn_eligible(node)
 
-            if node.cached_vector_id and node.cached_clean_ip:
-                cached_vec = find_vector(node.cached_vector_id)
-                self._set_state(EngineState.FAST_RESUME, "اتصال سریع هوشمند...", f"آزمایش مسیر بهینه «{disp_name}»", 20)
-                self.bridge.update_route(
-                    remote_host=node.cached_clean_ip,
-                    remote_port=node.port,
-                    vector=cached_vec,
-                    custom_stride=self.settings.forward_stride_bytes,
-                    jitter_bytes=self.settings.stride_jitter_bytes,
-                    raw_passthrough=(cached_vec.family == "DIRECT"),
-                    flush_existing_pool=True,
-                )
-                f_ok, f_ms, _ = self._probe_fast_tuple(http_port=self.xray.active_http_port, timeout=3.8)
-                if self._is_op_cancelled(gen_id):
-                    return False
-                if f_ok:
-                    soft_winners.append((f_ms, node.cached_clean_ip, cached_vec))
-                    self._set_state(
-                        EngineState.VERIFYING_STABILITY,
-                        "تایید پایداری استریم...",
-                        f"پینگ اولیه {f_ms}ms — بررسی سلامت تونل",
-                        75,
-                    )
-                    q_ok, q_ms, q_up, _ = self._probe_full_tuple(
-                        http_port=self.xray.active_http_port,
-                        verify_upload=self.settings.verify_upload_stream,
-                        require_youtube_6s=self.settings.require_youtube_6s,
-                        abort_check=lambda: self._is_op_cancelled(gen_id),
-                    )
+            def _try_vectors_on_host(ep_host: str, vec_subset: List[BypassVector], start_pct: int, span_pct: int) -> bool:
+                total_v = max(1, len(vec_subset))
+                for idx_v, vec in enumerate(vec_subset, 1):
                     if self._is_op_cancelled(gen_id):
                         return False
-                    if q_ok:
-                        self._lock_winning_tunnel(
-                            gen_id=gen_id,
-                            node=node,
-                            endpoint_ip=node.cached_clean_ip,
-                            vec=cached_vec,
-                            ping_ms=q_ms,
-                            upload_kbps=q_up,
-                            raw_passthrough=(cached_vec.family == "DIRECT"),
-                        )
-                        return True
-
-            if self.settings.auto_clean_ip and CleanIpScanner.is_cdn_eligible(node):
-                self._set_state(EngineState.SCANNING_CLEAN_IP, "جستجوی خودکار IP تمیز...", f"کاوش لبه پورت {node.port}", 28)
-
-            candidate_endpoints = self._resolve_candidate_endpoints(node=node, gen_id=gen_id, sample_count=38)
-
-            vectors_to_try = self._build_vector_plan(node, self.settings.engine_mode)[:max_vectors]
-            total_steps = max(1, len(candidate_endpoints) * len(vectors_to_try))
-            step_counter = 0
-
-            for endpoint in candidate_endpoints[:3]:
-                if self._is_op_cancelled(gen_id):
-                    return False
-                if CleanIpScanner.fast_tcp_ping(endpoint, node.port, timeout=1.6) < 0:
-                    step_counter += len(vectors_to_try)
-                    continue
-
-                for vec in vectors_to_try:
-                    if self._is_op_cancelled(gen_id):
-                        return False
-                    step_counter += 1
-                    pct = 32 + int((step_counter / total_steps) * 62)
+                    pct = start_pct + int((idx_v / total_v) * span_pct)
                     self._set_state(
                         EngineState.PROBING_VECTORS,
-                        f"تنظیم موتور عبوری روی «{disp_name}»...",
+                        f"تست موتور عبوری روی «{disp_name}»...",
                         f"آزمایش {vec.vector_id} ({vec.code_name})",
                         progress=pct,
                     )
-
                     self.bridge.update_route(
-                        remote_host=endpoint,
+                        remote_host=ep_host,
                         remote_port=node.port,
                         vector=vec,
                         custom_stride=self.settings.forward_stride_bytes,
@@ -2729,18 +3091,17 @@ class AlanAutoPilotEngine:
                         raw_passthrough=(vec.family == "DIRECT"),
                         flush_existing_pool=True,
                     )
-
                     q_ok, q_ms, _ = self._probe_fast_tuple(http_port=self.xray.active_http_port, timeout=4.0)
                     if self._is_op_cancelled(gen_id):
                         return False
                     if not q_ok:
                         continue
 
-                    soft_winners.append((q_ms, endpoint, vec))
+                    soft_winners.append((q_ms, ep_host, vec))
                     self._set_state(
                         EngineState.VERIFYING_STABILITY,
-                        "تست پایداری ۶ ثانیه‌ای و آپلود...",
-                        f"پینگ اولیه {q_ms}ms — تایید سلامت استریم",
+                        "تایید پایداری استریم و آپلود...",
+                        f"پینگ اولیه {q_ms}ms — بررسی سلامت تونل",
                         progress=min(96, pct + 4),
                     )
                     f_ok, f_ms, f_up, _ = self._probe_full_tuple(
@@ -2755,35 +3116,36 @@ class AlanAutoPilotEngine:
                         self._lock_winning_tunnel(
                             gen_id=gen_id,
                             node=node,
-                            endpoint_ip=endpoint,
+                            endpoint_ip=ep_host,
                             vec=vec,
                             ping_ms=f_ms,
                             upload_kbps=f_up,
                             raw_passthrough=(vec.family == "DIRECT"),
                         )
                         return True
-
                     if len(soft_winners) >= 2:
-                        soft_winners.sort(key=lambda x: x[0])
-                        best_ping, best_ep, best_v = soft_winners[0]
-                        self.bridge.update_route(
-                            remote_host=best_ep,
-                            remote_port=node.port,
-                            vector=best_v,
-                            custom_stride=self.settings.forward_stride_bytes,
-                            jitter_bytes=self.settings.stride_jitter_bytes,
-                            raw_passthrough=(best_v.family == "DIRECT"),
-                            flush_existing_pool=True,
-                        )
-                        self._lock_winning_tunnel(
-                            gen_id=gen_id,
-                            node=node,
-                            endpoint_ip=best_ep,
-                            vec=best_v,
-                            ping_ms=best_ping,
-                            upload_kbps=0.0,
-                            raw_passthrough=(best_v.family == "DIRECT"),
-                        )
+                        break
+                return False
+
+            if orig_ep and (CleanIpScanner.fast_tcp_ping(orig_ep, node.port, timeout=1.6) >= 0):
+                stage1_vecs = vectors_all[:5] if can_cdn_fallback else vectors_all
+                if _try_vectors_on_host(orig_ep, stage1_vecs, start_pct=18, span_pct=(42 if can_cdn_fallback else 75)):
+                    return True
+
+            if (not soft_winners) and can_cdn_fallback and (not self._is_op_cancelled(gen_id)):
+                self._set_state(
+                    EngineState.SCANNING_CLEAN_IP,
+                    "هاست اصلی مسدود است — جستجوی IP تمیز...",
+                    f"کاوش لبه جایگزین برای پورت {node.port}",
+                    progress=62,
+                )
+                fallback_ips = self._discover_fallback_clean_ips(node=node, gen_id=gen_id, sample_count=34)
+                for fb_ip in fallback_ips[:2]:
+                    if self._is_op_cancelled(gen_id) or (fb_ip == orig_ep):
+                        continue
+                    if CleanIpScanner.fast_tcp_ping(fb_ip, node.port, timeout=1.5) < 0:
+                        continue
+                    if _try_vectors_on_host(fb_ip, vectors_all, start_pct=66, span_pct=28):
                         return True
 
             if soft_winners and (not self._is_op_cancelled(gen_id)):
@@ -2838,7 +3200,10 @@ class AlanAutoPilotEngine:
         self._active_runtime_vec = vec
 
         node.cached_vector_id = vec.vector_id
-        if CleanIpScanner.is_cdn_eligible(node) and (endpoint_ip != node.original_host):
+        orig_check = CleanIpScanner.resolve_unpoisoned_ipv4(node.original_host, timeout=1.0)
+        if endpoint_ip in (node.original_host, orig_check):
+            node.cached_clean_ip = ""
+        elif CleanIpScanner.is_cdn_eligible(node):
             node.cached_clean_ip = endpoint_ip
         node.last_ping_ms = ping_ms
         node.upload_kbps = upload_kbps

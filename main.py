@@ -75,6 +75,7 @@ def _wire_controller_to_window(controller: AlanQtBackendController, window):
         ("scan_state_changed", "on_scan_state_changed"),
         ("task_progress_updated", "on_task_progress"),
         ("tun_status_changed", "on_tun_status_changed"),
+        ("auto_locations_updated", "on_auto_locations_updated"),
     ]
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
@@ -210,6 +211,7 @@ def main():
         controller.engine._notify_subscriptions_updated()
         controller.engine._notify_profiles_updated(save_selection=False)
         controller.engine._notify_verified_outputs_updated()
+        controller.engine._notify_auto_locations_updated()
         if "--tun-on" in sys.argv:
             controller.engine.set_tun_mode(True)
         controller.engine._push_telemetry()

@@ -32,6 +32,7 @@ class AlanQtBackendController(QObject):
     scan_state_changed = Signal(bool, str)
     task_progress_updated = Signal(bool, int, str)
     tun_status_changed = Signal(bool, bool, str)
+    auto_locations_updated = Signal(list, str)
     _quit_sig = Signal()
 
     def __init__(self, base_dir: str, parent: Optional[QObject] = None):
@@ -51,6 +52,25 @@ class AlanQtBackendController(QObject):
         self.engine.on_tun_status = self.tun_status_changed.emit
         self._quit_sig.connect(self.quit_application, Qt.ConnectionType.QueuedConnection)
         self.engine.on_request_quit = self._quit_sig.emit
+
+    def get_auto_locations(self) -> list:
+        return self.engine.get_available_auto_locations()
+
+    def get_selected_auto_location(self) -> str:
+        return self.engine.get_selected_auto_location()
+
+    def set_auto_location(self, location_code: str):
+        self.engine.set_auto_location(str(location_code or "ALL"))
+
+    def refresh_auto_pool(self):
+        import threading
+        threading.Thread(target=self.engine._sync_hidden_auto_pool, daemon=True).start()
+
+    def hunt_subscription_and_connect(self, sub_url_or_title: Any = "", title: str = ""):
+        self.engine.hunt_subscription_and_connect(sub_url_or_title=sub_url_or_title, title=title)
+
+    def scan_subscription_and_connect(self, sub_url_or_title: Any = "", title: str = ""):
+        self.engine.hunt_subscription_and_connect(sub_url_or_title=sub_url_or_title, title=title)
 
     def get_vectors(self) -> list:
         return self.engine.get_vectors_as_dicts()

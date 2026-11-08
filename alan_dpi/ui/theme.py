@@ -162,6 +162,9 @@ _TRANSLATIONS: dict[str, tuple[str, str]] = {
     "egress_active_sub": ("Exit: {country} | Secure Route", "خروجی: {country} | مسیر امن"),
     "egress_idle_sub": ("No Active Tunnel", "بدون تونل فعال"),
     "output_selector_lbl": ("Final Output:", "خروجی نهایی:"),
+    "auto_loc_lbl": ("Auto Location:", "لوکیشن خودکار:"),
+    "auto_loc_all_default": ("All Locations (Smart Auto)", "همه لوکیشن‌ها (انتخاب هوشمند)"),
+    "refresh_pool_tip": ("Refresh Auto-Connect Pool Locations", "بروزرسانی لوکیشن‌های مخزن خودکار"),
     "smart_auto_pool": ("Smart Auto-Pool (Best Verified / Auto-Hunt)", "حالت اتصال خودکار هوشمند (Smart Auto-Pool)"),
     "verified_item_fmt": ("[Verified] {name}  ({proto} | {vec} | {ping})", "[تاییدشده] {name}  ({proto} | {vec} | {ping})"),
     "ping_outputs_btn": ("Ping Outputs", "پینگ خروجی‌ها"),
@@ -174,6 +177,15 @@ _TRANSLATIONS: dict[str, tuple[str, str]] = {
     "tab_all": ("All ({n})", "همه ({n})"),
     "tab_manual": ("Manual ({n})", "دستی ({n})"),
     "manage_subs_btn": ("Manage Subscriptions", "مدیریت سابسکریپشن‌ها"),
+    "hunt_sub_btn": ("Scan Sub & Connect Best", "پویش کامل ساب و اتصال به بهترین"),
+    "hunt_sub_short_btn": ("Scan & Connect", "پویش و اتصال"),
+    "hunt_sub_dlg_title": ("Scan Subscription & Connect Best", "پویش کامل ساب و اتصال به بهترین"),
+    "hunt_sub_dlg_desc": ("Select an existing subscription or paste a new subscription URL to scan all configs and auto-connect to the fastest verified node.", "یکی از ساب‌های موجود را انتخاب کنید یا لینک ساب جدیدی وارد کنید تا تمام کانفیگ‌ها پویش شده و خودکار به بهترین گزینه متصل شود."),
+    "hunt_sub_choose_existing": ("Target Subscription:", "انتخاب سابسکریپشن هدف:"),
+    "hunt_sub_new_url_opt": ("--- Paste New Subscription URL Below ---", "--- وارد کردن لینک سابسکریپشن جدید در کادر پایین ---"),
+    "hunt_sub_url_lbl": ("Subscription URL (https://...):", "آدرس لینک سابسکریپشن (https://...):"),
+    "hunt_sub_title_lbl": ("Custom Group Title (Optional):", "عنوان دلخواه گروه (اختیاری):"),
+    "hunt_sub_start_btn": ("Scan Sub & Connect Best", "پویش کامل و اتصال به بهترین"),
     "import_clip_btn": ("Import Clipboard", "افزودن از کلیپ‌بورد"),
     "new_config_btn": ("New Config", "کانفیگ جدید"),
     "ping_btn": ("Ping All / Selected", "پینگ همه / انتخابی"),
@@ -684,6 +696,9 @@ def build_stylesheet(p: ThemePalette, lang: str = "fa") -> str:
         font-size: 12px;
         font-weight: 600;
     }}
+    QLabel#SecondaryLabel:disabled {{
+        color: {p.text_muted};
+    }}
     QLabel#PageTitle {{
         color: {p.text_primary};
         font-size: 17px;
@@ -747,6 +762,8 @@ def build_stylesheet(p: ThemePalette, lang: str = "fa") -> str:
     }}
     QComboBox:disabled, QLineEdit:disabled, QSpinBox:disabled {{
         color: {p.text_muted};
+        background-color: {p.surface_lo};
+        border: 1px solid {p.card_border};
     }}
     QComboBox::drop-down {{
         border: none;

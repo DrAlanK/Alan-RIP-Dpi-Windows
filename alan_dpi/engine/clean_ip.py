@@ -4,7 +4,7 @@ import random
 import socket
 import ssl
 import time
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 import requests
 from alan_dpi.engine.models import ProfileNode
 from alan_dpi.engine.mutator import TlsByteMutator
@@ -27,6 +27,33 @@ POISONED_DNS_PREFIXES = (
     "0.0.0.0",
     "127.",
     "198.18.",
+)
+
+NON_SWAPPABLE_PAAS_SUFFIXES = (
+    ".railway.app",
+    ".up.railway.app",
+    ".onrender.com",
+    ".fly.dev",
+    ".koyeb.app",
+    ".vercel.app",
+    ".netlify.app",
+    ".herokuapp.com",
+    ".hf.space",
+    ".huggingface.co",
+    ".ondigitalocean.app",
+    ".azurewebsites.net",
+    ".run.app",
+    ".appspot.com",
+    ".cloudfront.net",
+    ".fastly.net",
+    ".akamaized.net",
+    ".gcore.lu",
+    ".edg.io",
+    ".glitch.me",
+    ".replit.dev",
+    ".replit.app",
+    ".deno.dev",
+    ".supabase.co",
 )
 
 ACTIVE_EDGE_SUBNETS = [
@@ -82,6 +109,8 @@ CLOUDFLARE_HTTPS_PORTS = (443, 2053, 2083, 2087, 2096, 8443)
 ALL_CLOUDFLARE_PORTS = CLOUDFLARE_HTTPS_PORTS + CLOUDFLARE_HTTP_PORTS
 
 _DOH_CACHE: Dict[str, str] = {}
+_NON_SWAPPABLE_CNAME_HOSTS: Set[str] = set()
+_DOH_CNAME_CHECKED: Set[str] = set()
 
 
 class CleanIpScanner:
@@ -101,6 +130,50 @@ class CleanIpScanner:
             return any(addr in net for net in CLOUDFLARE_SUPERNETS)
         except ValueError:
             return False
+
+    @classmethod
+    def is_paas_or_non_swappable(cls, host: str, sni: str = "") -> bool:
+        for val in ((host or "").strip().lower(), (sni or "").strip().lower()):
+            if not val:
+                continue
+            if val in _NON_SWAPPABLE_CNAME_HOSTS:
+                return True
+            if any(val.endswith(sfx) or (val == sfx.lstrip(".")) for sfx in NON_SWAPPABLE_PAAS_SUFFIXES):
+                return True
+        return False
+
+    @classmethod
+    def _query_doh_with_cnames(cls, clean_h: str, timeout: float = 2.0) -> str:
+        doh_endpoints = (
+            f"https://1.1.1.1/dns-query?name={clean_h}&type=A",
+            f"https://8.8.8.8/resolve?name={clean_h}&type=A",
+        )
+        sess = requests.Session()
+        sess.trust_env = False
+        resolved_a = ""
+        try:
+            for url in doh_endpoints:
+                try:
+                    resp = sess.get(url, headers={"Accept": "application/dns-json"}, timeout=timeout)
+                    if resp.status_code == 200:
+                        answers = resp.json().get("Answer", [])
+                        _DOH_CNAME_CHECKED.add(clean_h)
+                        for ans in answers:
+                            atype = int(ans.get("type", 0))
+                            adata = str(ans.get("data", "")).strip().rstrip(".").lower()
+                            if (atype == 5) and adata:
+                                if any(adata.endswith(sfx) for sfx in NON_SWAPPABLE_PAAS_SUFFIXES):
+                                    _NON_SWAPPABLE_CNAME_HOSTS.add(clean_h)
+                            elif (atype == 1) and adata and (not cls.is_poisoned_ip(adata)) and (not resolved_a):
+                                resolved_a = adata
+                        if resolved_a:
+                            _DOH_CACHE[clean_h] = resolved_a
+                            return resolved_a
+                except Exception:
+                    continue
+        finally:
+            sess.close()
+        return ""
 
     @classmethod
     def resolve_unpoisoned_ipv4(cls, host: str, timeout: float = 2.0) -> str:
@@ -124,33 +197,11 @@ class CleanIpScanner:
         except Exception:
             pass
 
-        doh_endpoints = (
-            f"https://1.1.1.1/dns-query?name={clean_h}&type=A",
-            f"https://8.8.8.8/resolve?name={clean_h}&type=A",
-            f"https://9.9.9.9:5053/dns-query?name={clean_h}&type=A",
-        )
-        sess = requests.Session()
-        sess.trust_env = False
-        try:
-            for url in doh_endpoints:
-                try:
-                    resp = sess.get(url, headers={"Accept": "application/dns-json"}, timeout=timeout)
-                    if resp.status_code == 200:
-                        for ans in resp.json().get("Answer", []):
-                            if int(ans.get("type", 0)) == 1:
-                                ip_val = str(ans.get("data", "")).strip()
-                                if ip_val and (not cls.is_poisoned_ip(ip_val)):
-                                    _DOH_CACHE[clean_h] = ip_val
-                                    return ip_val
-                except Exception:
-                    continue
-        finally:
-            sess.close()
-        return ""
+        return cls._query_doh_with_cnames(clean_h, timeout=timeout)
 
     @staticmethod
     def is_domestic_or_direct_tunnel(node: ProfileNode) -> bool:
-        if node.protocol.upper() == "SHADOWSOCKS":
+        if node.protocol.upper() in ("SHADOWSOCKS", "SOCKS"):
             return True
         host_lower = (node.original_host or "").lower().strip()
         if host_lower.endswith(".ir"):
@@ -161,7 +212,7 @@ class CleanIpScanner:
     def is_cdn_eligible(cls, node: ProfileNode) -> bool:
         proto_upper = node.protocol.upper()
         uri_lower = node.uri.lower()
-        if proto_upper == "SHADOWSOCKS":
+        if proto_upper in ("SHADOWSOCKS", "SOCKS"):
             return False
         if "security=reality" in uri_lower:
             return False
@@ -170,7 +221,10 @@ class CleanIpScanner:
 
         host_lower = (node.original_host or "").lower().strip()
         sni_lower = (node.sni or "").lower().strip()
-        if host_lower.endswith(".ir"):
+        if host_lower.endswith(".ir") or sni_lower.endswith(".ir"):
+            return False
+
+        if cls.is_paas_or_non_swappable(host_lower, sni_lower):
             return False
 
         if int(node.port) not in ALL_CLOUDFLARE_PORTS:
@@ -180,10 +234,23 @@ class CleanIpScanner:
             if sni_lower.endswith(sfx) or host_lower.endswith(sfx):
                 return True
 
-        if cls.is_ip_in_cloudflare(node.original_host):
+        if cls.is_ip_in_cloudflare(host_lower):
             return True
 
-        resolved = cls.resolve_unpoisoned_ipv4(node.original_host, timeout=1.5)
+        for domain_candidate in (host_lower, sni_lower):
+            if (not domain_candidate) or cls.is_ip_in_cloudflare(domain_candidate):
+                continue
+            try:
+                ipaddress.ip_address(domain_candidate)
+                continue
+            except ValueError:
+                pass
+            if domain_candidate not in _DOH_CNAME_CHECKED:
+                cls._query_doh_with_cnames(domain_candidate, timeout=1.6)
+            if domain_candidate in _NON_SWAPPABLE_CNAME_HOSTS:
+                return False
+
+        resolved = cls.resolve_unpoisoned_ipv4(host_lower, timeout=1.5)
         if resolved and cls.is_ip_in_cloudflare(resolved):
             return True
 
@@ -198,7 +265,6 @@ class CleanIpScanner:
     def generate_candidate_pool(sample_count: int = 44) -> List[str]:
         candidates = list(SEED_CLEAN_IPS)
         per_subnet = max(2, ((sample_count - len(candidates)) // len(ACTIVE_EDGE_SUBNETS)) + 1)
-
         shuffled_subnets = list(ACTIVE_EDGE_SUBNETS)
         random.shuffle(shuffled_subnets)
 
@@ -213,7 +279,6 @@ class CleanIpScanner:
                     break
             if len(candidates) >= sample_count:
                 break
-
         return candidates[:sample_count]
 
     @classmethod
@@ -221,7 +286,6 @@ class CleanIpScanner:
         target = (host or "").strip()
         if not target:
             return -1
-
         resolved_ip = cls.resolve_unpoisoned_ipv4(target, timeout=1.4)
         if not resolved_ip:
             return -1

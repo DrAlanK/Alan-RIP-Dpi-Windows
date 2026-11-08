@@ -298,11 +298,127 @@ class BaseThemedDialog(QDialog):
         apply_windows_titlebar_theme(self, self._palette.is_dark)
 
 
+class HuntSubscriptionDialog(BaseThemedDialog):
+    def __init__(
+        self,
+        subscriptions: list,
+        groups: list[str],
+        palette: ThemePalette,
+        parent=None,
+    ):
+        super().__init__(I18N.t("hunt_sub_dlg_title"), palette, parent)
+        self._palette = palette
+        self.setMinimumSize(520, 310)
+        self.resize(560, 330)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 16, 20, 18)
+        root.setSpacing(12)
+
+        hdr_lbl = QLabel(I18N.t("hunt_sub_dlg_title"))
+        hdr_lbl.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
+        root.addWidget(hdr_lbl)
+
+        desc_lbl = QLabel(I18N.t("hunt_sub_dlg_desc"))
+        desc_lbl.setObjectName("MutedLabel")
+        desc_lbl.setWordWrap(True)
+        root.addWidget(desc_lbl)
+
+        card = NeuCard(mode="raised", radius=16.0, depth=4.6, pad=5.5)
+        card.set_palette_theme(palette)
+        form = QVBoxLayout(card)
+        form.setContentsMargins(18, 14, 18, 16)
+        form.setSpacing(10)
+
+        existing_lbl = QLabel(I18N.t("hunt_sub_choose_existing"))
+        existing_lbl.setObjectName("SecondaryLabel")
+        self.existing_combo = QComboBox()
+        self.existing_combo.addItem(I18N.t("hunt_sub_new_url_opt"), "")
+
+        seen_titles: set[str] = set()
+        for sub in subscriptions or []:
+            if isinstance(sub, dict):
+                t = strip_emojis(str(sub.get("title") or sub.get("name") or "")).strip()
+                u = str(sub.get("url") or "").strip()
+                if t and t not in seen_titles:
+                    seen_titles.add(t)
+                    self.existing_combo.addItem(f"{t} ({u[:36]}...)" if len(u) > 36 else f"{t} ({u})", t)
+        for g in groups or []:
+            g_clean = strip_emojis(str(g or "")).strip()
+            if g_clean and g_clean not in ("Manual", "__ALL__") and g_clean not in seen_titles:
+                seen_titles.add(g_clean)
+                self.existing_combo.addItem(g_clean, g_clean)
+
+        if self.existing_combo.count() > 1:
+            self.existing_combo.setCurrentIndex(1)
+        self.existing_combo.currentIndexChanged.connect(self._sync_inputs)
+
+        url_lbl = QLabel(I18N.t("hunt_sub_url_lbl"))
+        url_lbl.setObjectName("SecondaryLabel")
+        self.url_edit = QLineEdit()
+        self.url_edit.setPlaceholderText(I18N.t("subs_url_ph"))
+        enforce_english_ltr(self.url_edit, mono_size=10)
+        clip_txt = QGuiApplication.clipboard().text().strip()
+        if clip_txt.startswith("http://") or clip_txt.startswith("https://"):
+            self.url_edit.setText(clip_txt)
+            self.existing_combo.setCurrentIndex(0)
+
+        title_lbl = QLabel(I18N.t("hunt_sub_title_lbl"))
+        title_lbl.setObjectName("SecondaryLabel")
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText(I18N.t("subs_title_ph"))
+
+        form.addWidget(existing_lbl)
+        form.addWidget(self.existing_combo)
+        form.addWidget(url_lbl)
+        form.addWidget(self.url_edit)
+        form.addWidget(title_lbl)
+        form.addWidget(self.title_edit)
+        root.addWidget(card, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        cancel_btn = QPushButton(I18N.t("cancel"))
+        cancel_btn.setObjectName("GhostBtn")
+        cancel_btn.clicked.connect(self.reject)
+
+        self.start_btn = ActionPillButton("bolt", I18N.t("hunt_sub_start_btn"), variant="gold")
+        self.start_btn.set_palette_theme(palette)
+        self.start_btn.clicked.connect(self._on_confirm)
+
+        btn_row.addWidget(cancel_btn)
+        btn_row.addWidget(self.start_btn)
+        root.addLayout(btn_row)
+
+        self._sync_inputs()
+
+    def _sync_inputs(self, *_args) -> None:
+        is_new_url = not bool(self.existing_combo.currentData())
+        self.url_edit.setEnabled(is_new_url)
+        self.title_edit.setEnabled(is_new_url)
+
+    def _on_confirm(self) -> None:
+        sub_target, _ = self.collected_target()
+        if sub_target:
+            self.accept()
+
+    def collected_target(self) -> tuple[str, str]:
+        url_txt = self.url_edit.text().strip()
+        title_txt = self.title_edit.text().strip()
+        existing_tag = str(self.existing_combo.currentData() or "").strip()
+        if url_txt and (not existing_tag or self.url_edit.isEnabled()):
+            return url_txt, title_txt
+        if existing_tag:
+            return existing_tag, existing_tag
+        return url_txt, title_txt
+
+
 class SubscriptionManagerDialog(BaseThemedDialog):
     add_requested = Signal(str, str)
     refresh_requested = Signal()
     delete_requested = Signal(int)
     auto_update_hours_changed = Signal(int)
+    hunt_subscription_requested = Signal(str, str)
 
     def __init__(
         self,
@@ -314,8 +430,8 @@ class SubscriptionManagerDialog(BaseThemedDialog):
         super().__init__(I18N.t("subs_dlg_title"), palette, parent)
         self._palette = palette
         self._item_cards: list[NeuCard] = []
-        self.setMinimumSize(580, 420)
-        self.resize(640, 460)
+        self.setMinimumSize(620, 440)
+        self.resize(680, 480)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 16, 20, 18)
@@ -324,7 +440,7 @@ class SubscriptionManagerDialog(BaseThemedDialog):
         hdr_row = QHBoxLayout()
         hdr_lbl = QLabel(I18N.t("subs_dlg_title"))
         hdr_lbl.setFont(make_ui_font(13, QFont.Weight.ExtraBold))
-        self.refresh_btn = ActionPillButton("refresh", I18N.t("subs_refresh_btn"), variant="gold")
+        self.refresh_btn = ActionPillButton("refresh", I18N.t("subs_refresh_btn"), variant="ghost")
         self.refresh_btn.set_palette_theme(palette)
         self.refresh_btn.clicked.connect(self.refresh_requested.emit)
         hdr_row.addWidget(hdr_lbl)
@@ -340,7 +456,7 @@ class SubscriptionManagerDialog(BaseThemedDialog):
 
         self.title_edit = QLineEdit()
         self.title_edit.setPlaceholderText(I18N.t("subs_title_ph"))
-        self.title_edit.setMaximumWidth(190)
+        self.title_edit.setMaximumWidth(175)
 
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText(I18N.t("subs_url_ph"))
@@ -351,9 +467,14 @@ class SubscriptionManagerDialog(BaseThemedDialog):
         self.add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.add_btn.clicked.connect(self._on_add)
 
+        self.hunt_input_btn = ActionPillButton("bolt", I18N.t("hunt_sub_btn"), variant="gold")
+        self.hunt_input_btn.set_palette_theme(palette)
+        self.hunt_input_btn.clicked.connect(self._on_hunt_from_input)
+
         add_row.addWidget(self.title_edit)
         add_row.addWidget(self.url_edit, 1)
         add_row.addWidget(self.add_btn)
+        add_row.addWidget(self.hunt_input_btn)
         root.addWidget(self.add_card)
 
         sched_row = QHBoxLayout()
@@ -396,6 +517,23 @@ class SubscriptionManagerDialog(BaseThemedDialog):
             self.url_edit.clear()
             self.title_edit.clear()
 
+    def _on_hunt_from_input(self) -> None:
+        url = self.url_edit.text().strip()
+        title = self.title_edit.text().strip() or "Subscription"
+        if url:
+            self.hunt_subscription_requested.emit(url, title)
+            self.accept()
+            return
+        clip_txt = QGuiApplication.clipboard().text().strip()
+        if clip_txt.startswith("http://") or clip_txt.startswith("https://"):
+            self.hunt_subscription_requested.emit(clip_txt, title)
+            self.accept()
+
+    def _trigger_row_hunt(self, sub_target: str, sub_title: str) -> None:
+        if sub_target:
+            self.hunt_subscription_requested.emit(sub_target, sub_title)
+            self.accept()
+
     def _on_sched_changed(self, idx: int) -> None:
         hrs = self.sched_combo.itemData(idx)
         if hrs is not None:
@@ -431,12 +569,20 @@ class SubscriptionManagerDialog(BaseThemedDialog):
                 u_lbl.setObjectName("MutedLabel")
                 enforce_english_ltr(u_lbl, mono_size=9)
 
+                hunt_row_btn = ActionPillButton("bolt", I18N.t("hunt_sub_short_btn"), variant="emerald")
+                hunt_row_btn.set_palette_theme(self._palette)
+                target_arg = title if title else url
+                hunt_row_btn.clicked.connect(
+                    lambda _c=False, tg=target_arg, tt=title: self._trigger_row_hunt(tg, tt)
+                )
+
                 del_btn = VectorIconButton("trash", size=30, danger_hover=True)
                 del_btn.set_palette_theme(self._palette)
                 del_btn.clicked.connect(lambda _c=False, i=idx: self.delete_requested.emit(i))
 
                 row.addWidget(t_lbl)
                 row.addWidget(u_lbl, 1)
+                row.addWidget(hunt_row_btn)
                 row.addWidget(del_btn)
                 self.list_layout.addWidget(card)
 
@@ -781,6 +927,8 @@ class HomePage(QWidget):
     connect_triggered = Signal(str)
     disconnect_triggered = Signal()
     output_selection_changed = Signal(str)
+    auto_location_changed = Signal(str)
+    refresh_auto_pool_requested = Signal()
     ping_verified_requested = Signal()
     clear_verified_requested = Signal()
     system_proxy_toggled = Signal(bool)
@@ -798,6 +946,8 @@ class HomePage(QWidget):
         self._is_connecting = False
         self._autopilot_enabled = True
         self._selected_profile_uid = ""
+        self._auto_locations: list[dict] = []
+        self._selected_auto_location = "ALL"
         self._verified_outputs: list[dict] = []
         self._vault_profiles: list[dict] = []
         self._last_snap: dict = {}
@@ -890,13 +1040,26 @@ class HomePage(QWidget):
         dock_vbox.setSpacing(9)
 
         out_row = QHBoxLayout()
-        out_row.setSpacing(10)
+        out_row.setSpacing(8)
         self.out_lbl = QLabel(I18N.t("output_selector_lbl"))
         self.out_lbl.setObjectName("SecondaryLabel")
 
         self.output_combo = QComboBox()
         self.output_combo.setIconSize(QSize(24, 16))
+        self.output_combo.setMinimumWidth(210)
         self.output_combo.currentIndexChanged.connect(self._on_output_combo_changed)
+
+        self.auto_loc_lbl = QLabel(I18N.t("auto_loc_lbl"))
+        self.auto_loc_lbl.setObjectName("SecondaryLabel")
+
+        self.auto_loc_combo = QComboBox()
+        self.auto_loc_combo.setIconSize(QSize(24, 16))
+        self.auto_loc_combo.setMinimumWidth(180)
+        self.auto_loc_combo.currentIndexChanged.connect(self._on_auto_loc_combo_changed)
+
+        self.refresh_pool_btn = VectorIconButton("refresh", size=34)
+        self.refresh_pool_btn.setToolTip(I18N.t("refresh_pool_tip"))
+        self.refresh_pool_btn.clicked.connect(self.refresh_auto_pool_requested.emit)
 
         self.ping_out_btn = ActionPillButton("bolt", I18N.t("ping_outputs_btn"), variant="ghost")
         self.ping_out_btn.clicked.connect(self.ping_verified_requested.emit)
@@ -906,7 +1069,12 @@ class HomePage(QWidget):
         self.clear_out_btn.clicked.connect(self.clear_verified_requested.emit)
 
         out_row.addWidget(self.out_lbl)
-        out_row.addWidget(self.output_combo, 1)
+        out_row.addWidget(self.output_combo, 3)
+        out_row.addSpacing(6)
+        out_row.addWidget(self.auto_loc_lbl)
+        out_row.addWidget(self.auto_loc_combo, 2)
+        out_row.addWidget(self.refresh_pool_btn)
+        out_row.addSpacing(4)
         out_row.addWidget(self.ping_out_btn)
         out_row.addWidget(self.clear_out_btn)
 
@@ -947,11 +1115,94 @@ class HomePage(QWidget):
         root.addWidget(self.dock_card)
 
         self._rebuild_output_combo()
+        self._rebuild_auto_location_combo()
+        self._sync_auto_location_enabled_state()
         self._refresh_visual_route()
 
     def selected_output_key(self) -> str:
         data = self.output_combo.currentData()
         return str(data) if data is not None else self.SMART_AUTO_KEY
+
+    def selected_auto_location_code(self) -> str:
+        data = self.auto_loc_combo.currentData()
+        return str(data).strip().upper() if data is not None else (self._selected_auto_location or "ALL")
+
+    def on_auto_locations_updated(self, locations: list, selected_code: str = "") -> None:
+        self._auto_locations = [dict(x) for x in (locations or []) if isinstance(x, dict)]
+        if selected_code and str(selected_code).strip():
+            self._selected_auto_location = str(selected_code).strip().upper()
+        elif not self._selected_auto_location:
+            self._selected_auto_location = "ALL"
+        self._rebuild_auto_location_combo()
+        self._sync_auto_location_enabled_state()
+
+    def _rebuild_auto_location_combo(self) -> None:
+        target_code = str(self._selected_auto_location or "ALL").strip().upper()
+        is_en = I18N.lang == "en"
+
+        with QSignalBlocker(self.auto_loc_combo):
+            self.auto_loc_combo.clear()
+            matched_idx = 0
+
+            if not self._auto_locations:
+                self.auto_loc_combo.addItem(
+                    make_flag_qicon("ALL", 24, 16),
+                    I18N.t("auto_loc_all_default"),
+                    "ALL",
+                )
+                self.auto_loc_combo.setCurrentIndex(0)
+                return
+
+            for idx, item in enumerate(self._auto_locations):
+                code = str(item.get("code") or "ALL").strip().upper()
+                if code == "UK":
+                    code = "GB"
+
+                raw_label = str(
+                    item.get("label_en" if is_en else "label_fa")
+                    or item.get("label_fa" if is_en else "label_en")
+                    or ""
+                ).strip()
+                if not raw_label:
+                    cname = str(
+                        item.get("name_en" if is_en else "name_fa")
+                        or GeoFlagResolver.get_spec(code).localized_name()
+                    ).strip()
+                    cnt = get_int(item, "count", 0)
+                    if code == "ALL":
+                        raw_label = f"{cname} — {cnt}" if cnt > 0 else cname
+                    else:
+                        raw_label = f"{cname} ({code}) — {cnt}" if cnt > 0 else f"{cname} ({code})"
+
+                icon_code = "" if code == "ALL" else code
+                self.auto_loc_combo.addItem(
+                    make_flag_qicon(icon_code, 24, 16),
+                    strip_emojis(raw_label),
+                    code,
+                )
+                if code == target_code:
+                    matched_idx = idx
+
+            self.auto_loc_combo.setCurrentIndex(matched_idx)
+            actual_data = self.auto_loc_combo.itemData(matched_idx)
+            if actual_data is not None:
+                self._selected_auto_location = str(actual_data).strip().upper()
+
+    def _on_auto_loc_combo_changed(self, idx: int) -> None:
+        if idx < 0:
+            return
+        code = self.selected_auto_location_code()
+        if code:
+            self._selected_auto_location = code
+            self.auto_location_changed.emit(code)
+
+    def _sync_auto_location_enabled_state(self) -> None:
+        is_auto = bool(self._autopilot_enabled) or (
+            self.selected_output_key() in (self.SMART_AUTO_KEY, "__smart_pool__")
+        )
+        self.auto_loc_lbl.setEnabled(is_auto)
+        self.auto_loc_combo.setEnabled(is_auto)
+        self.refresh_pool_btn.setEnabled(is_auto)
 
     def _on_main_button_clicked(self) -> None:
         if self._is_connecting or self._is_connected:
@@ -964,6 +1215,7 @@ class HomePage(QWidget):
         if self._autopilot_enabled:
             with QSignalBlocker(self.output_combo):
                 self.output_combo.setCurrentIndex(0)
+            self._sync_auto_location_enabled_state()
             self.autopilot_toggled.emit(True)
         else:
             self.autopilot_toggled.emit(False)
@@ -979,6 +1231,7 @@ class HomePage(QWidget):
                 if chosen_uid:
                     self._selected_profile_uid = chosen_uid
                     self.output_selection_changed.emit(chosen_uid)
+            self._sync_auto_location_enabled_state()
         self._refresh_visual_route()
 
     def _on_output_combo_changed(self, idx: int) -> None:
@@ -990,11 +1243,13 @@ class HomePage(QWidget):
             set_switch_blocked(self.sw_autopilot, True)
             with QSignalBlocker(self.output_combo):
                 self.output_combo.setCurrentIndex(0)
+            self._sync_auto_location_enabled_state()
             self.autopilot_toggled.emit(True)
         else:
             self._autopilot_enabled = False
             self._selected_profile_uid = key
             set_switch_blocked(self.sw_autopilot, False)
+            self._sync_auto_location_enabled_state()
             self.autopilot_toggled.emit(False)
             self.output_selection_changed.emit(key)
         self._refresh_visual_route()
@@ -1009,12 +1264,14 @@ class HomePage(QWidget):
                     self._selected_profile_uid = extract_profile_uid(p, i)
                     break
         self._rebuild_output_combo()
+        self._sync_auto_location_enabled_state()
 
     def set_verified_outputs(self, outputs: list[dict], select_uid: str = "") -> None:
         self._verified_outputs = list(outputs or [])
         if select_uid:
             self._selected_profile_uid = select_uid
         self._rebuild_output_combo()
+        self._sync_auto_location_enabled_state()
         self._refresh_visual_route()
 
     def _collect_selectable_configs(self) -> list[dict]:
@@ -1080,16 +1337,27 @@ class HomePage(QWidget):
             self._selected_profile_uid = selected_uid
         set_switch_blocked(self.sw_autopilot, self._autopilot_enabled)
         self._rebuild_output_combo()
+        self._sync_auto_location_enabled_state()
 
     def sync_switches(self, settings: dict) -> None:
         if "system_proxy" in settings:
             set_switch_blocked(self.sw_sys_proxy, get_bool(settings, "system_proxy", True))
 
-        if ("autopilot_enabled" in settings) or ("autopilot" in settings):
-            ap_key = "autopilot_enabled" if ("autopilot_enabled" in settings) else "autopilot"
-            ap_on = get_bool(settings, ap_key, True)
+        if ("auto_mode_enabled" in settings) or ("autopilot_enabled" in settings) or ("autopilot" in settings):
+            if "auto_mode_enabled" in settings:
+                ap_on = get_bool(settings, "auto_mode_enabled", True)
+            elif "autopilot_enabled" in settings:
+                ap_on = get_bool(settings, "autopilot_enabled", True)
+            else:
+                ap_on = get_bool(settings, "autopilot", True)
             sel_uid = str(settings.get("active_profile_uid") or self._selected_profile_uid)
             self.sync_autopilot_state(ap_on, sel_uid)
+
+        if "selected_auto_location" in settings or "auto_location" in settings:
+            loc_code = str(settings.get("selected_auto_location") or settings.get("auto_location") or "").strip().upper()
+            if loc_code:
+                self._selected_auto_location = loc_code
+                self._rebuild_auto_location_combo()
 
         if ("tun_enabled" in settings) or ("tun_badge" in settings):
             tun_en = bool(settings.get("tun_enabled"))
@@ -1229,13 +1497,22 @@ class HomePage(QWidget):
         self.apply_tun_status(tun_en, tun_en and self._is_connected, "", tun_b)
 
         snap_uid = str(snap.get("active_profile_uid") or "").strip()
-        if "autopilot_enabled" in snap:
+        if "auto_mode_enabled" in snap:
+            self.sync_autopilot_state(bool(snap.get("auto_mode_enabled")), snap_uid)
+        elif "autopilot_enabled" in snap:
             self.sync_autopilot_state(bool(snap.get("autopilot_enabled")), snap_uid)
         elif self._autopilot_enabled:
             with QSignalBlocker(self.output_combo):
                 self.output_combo.setCurrentIndex(0)
+            self._sync_auto_location_enabled_state()
         elif snap_uid and snap_uid != self._selected_profile_uid:
             self.sync_autopilot_state(False, snap_uid)
+
+        if "selected_auto_location" in snap:
+            loc_c = str(snap.get("selected_auto_location") or "").strip().upper()
+            if loc_c and loc_c != self._selected_auto_location:
+                self._selected_auto_location = loc_c
+                self._rebuild_auto_location_combo()
 
         self.radar_core.set_ui_phase(self._ui_phase)
         self.connect_btn.set_phase_and_label(self._ui_phase, str(snap.get("button_text") or ""))
@@ -1294,6 +1571,8 @@ class HomePage(QWidget):
     def retranslate_ui(self) -> None:
         self.connect_btn.retranslate_ui()
         self.out_lbl.setText(I18N.t("output_selector_lbl"))
+        self.auto_loc_lbl.setText(I18N.t("auto_loc_lbl"))
+        self.refresh_pool_btn.setToolTip(I18N.t("refresh_pool_tip"))
         self.ping_out_btn.set_label_text(I18N.t("ping_outputs_btn"))
         self.clear_out_btn.setToolTip(I18N.t("clear_outputs_tip"))
         self.lbl_sys_proxy.setText(I18N.t("sw_sys_proxy"))
@@ -1302,6 +1581,8 @@ class HomePage(QWidget):
         for c in (self.ip_card, self.ping_card, self.dl_card, self.ul_card):
             c.retranslate_ui()
         self._rebuild_output_combo()
+        self._rebuild_auto_location_combo()
+        self._sync_auto_location_enabled_state()
         if self._last_snap:
             self.apply_telemetry(self._last_snap)
         else:
@@ -1316,6 +1597,7 @@ class HomePage(QWidget):
         self.chronometer.set_palette_theme(palette)
         self.route_strip.set_palette_theme(palette)
         self.dock_card.set_palette_theme(palette)
+        self.refresh_pool_btn.set_palette_theme(palette)
         self.ping_out_btn.set_palette_theme(palette)
         self.clear_out_btn.set_palette_theme(palette)
         for sw in (self.sw_sys_proxy, self.sw_tun, self.sw_autopilot):
@@ -1338,6 +1620,7 @@ class ConfigsPage(QWidget):
     export_verified_requested = Signal()
     send_batch_to_lab_requested = Signal(list, str)
     manage_subs_requested = Signal()
+    hunt_subscription_requested = Signal(str, str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1355,6 +1638,7 @@ class ConfigsPage(QWidget):
         root.setSpacing(10)
 
         hdr = QHBoxLayout()
+        hdr.setSpacing(8)
         t_col = QVBoxLayout()
         t_col.setSpacing(2)
         self.title_lbl = QLabel(I18N.t("vault_title"))
@@ -1364,10 +1648,14 @@ class ConfigsPage(QWidget):
         t_col.addWidget(self.title_lbl)
         t_col.addWidget(self.sub_lbl)
 
+        self.hunt_sub_btn = ActionPillButton("bolt", I18N.t("hunt_sub_btn"), variant="emerald")
+        self.hunt_sub_btn.clicked.connect(self._on_hunt_sub_clicked)
+
         self.manage_subs_btn = ActionPillButton("plus", I18N.t("manage_subs_btn"), variant="ghost")
         self.manage_subs_btn.clicked.connect(self.manage_subs_requested.emit)
 
         hdr.addLayout(t_col, 1)
+        hdr.addWidget(self.hunt_sub_btn)
         hdr.addWidget(self.manage_subs_btn)
         root.addLayout(hdr)
 
@@ -1474,6 +1762,21 @@ class ConfigsPage(QWidget):
 
         self._apply_table_headers()
         self._rebuild_group_tabs()
+
+    def _on_hunt_sub_clicked(self) -> None:
+        if self._current_group_key not in ("__ALL__", "Manual"):
+            self.hunt_subscription_requested.emit(self._current_group_key, self._current_group_key)
+            return
+        dlg = HuntSubscriptionDialog(
+            subscriptions=self._subscriptions,
+            groups=self.known_group_names(),
+            palette=self._palette,
+            parent=self.window(),
+        )
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            target_sub, custom_title = dlg.collected_target()
+            if target_sub:
+                self.hunt_subscription_requested.emit(target_sub, custom_title)
 
     def _apply_table_headers(self) -> None:
         headers = [
@@ -1797,6 +2100,7 @@ class ConfigsPage(QWidget):
         act_active = menu.addAction(I18N.t("ctx_set_active"))
         act_ping = menu.addAction(I18N.t("ctx_real_ping"))
         act_gemini = menu.addAction(I18N.t("ctx_check_gemini"))
+        act_hunt_sub = menu.addAction(I18N.t("hunt_sub_btn"))
         menu.addSeparator()
         act_lab_sel = menu.addAction(I18N.t("ctx_send_sel_lab"))
         act_lab_tab = menu.addAction(I18N.t("ctx_send_tab_lab"))
@@ -1821,6 +2125,8 @@ class ConfigsPage(QWidget):
             self.ping_configs_requested.emit(targets if targets else None)
         elif chosen == act_gemini:
             self.probe_gemini_requested.emit(targets if targets else None)
+        elif chosen == act_hunt_sub:
+            self._on_hunt_sub_clicked()
         elif chosen == act_lab_sel:
             self.send_batch_to_lab_requested.emit(targets, "")
         elif chosen == act_lab_tab:
@@ -1839,6 +2145,7 @@ class ConfigsPage(QWidget):
     def retranslate_ui(self) -> None:
         self.title_lbl.setText(I18N.t("vault_title"))
         self.sub_lbl.setText(I18N.t("vault_subtitle"))
+        self.hunt_sub_btn.set_label_text(I18N.t("hunt_sub_btn"))
         self.manage_subs_btn.set_label_text(I18N.t("manage_subs_btn"))
         self.btn_import.set_label_text(I18N.t("import_clip_btn"))
         self.btn_new.set_label_text(I18N.t("new_config_btn"))
@@ -1858,6 +2165,7 @@ class ConfigsPage(QWidget):
         self.tabs_card.set_palette_theme(palette)
         self.toolbar_card.set_palette_theme(palette)
         for b in (
+            self.hunt_sub_btn,
             self.manage_subs_btn,
             self.btn_import,
             self.btn_new,

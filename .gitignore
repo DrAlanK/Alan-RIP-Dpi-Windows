@@ -8,11 +8,9 @@ release/
 logs/
 configs/*.json
 configs/*.dat
-configs/.auto_pool_url
+configs/*.log
+configs/*.auto_pool_url
 core/*.exe
 core/*.dll
 core/*.dat
-
-configs/*.log
-commit.ps1
-upload_release.py
+ship_v1.2.0.ps1

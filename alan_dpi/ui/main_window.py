@@ -156,6 +156,7 @@ class BackendControllerAdapter(QObject):
     log_message = Signal(str)
     profiles_updated = Signal(list, int)
     verified_outputs_updated = Signal(list)
+    auto_locations_updated = Signal(list, str)
     settings_updated = Signal(dict)
     subscriptions_updated = Signal(list)
     scan_row = Signal(dict)
@@ -196,6 +197,49 @@ class DemoDpiController(BackendControllerAdapter):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._selected_auto_location = "ALL"
+        self._auto_locations: list[dict] = [
+            {
+                "code": "ALL",
+                "name_fa": "همه لوکیشن‌ها",
+                "name_en": "All Locations",
+                "label_fa": "همه لوکیشن‌ها — 240",
+                "label_en": "All Locations — 240",
+                "count": 240,
+            },
+            {
+                "code": "DE",
+                "name_fa": "آلمان",
+                "name_en": "Germany",
+                "label_fa": "آلمان (DE) — 85",
+                "label_en": "Germany (DE) — 85",
+                "count": 85,
+            },
+            {
+                "code": "NL",
+                "name_fa": "هلند",
+                "name_en": "Netherlands",
+                "label_fa": "هلند (NL) — 64",
+                "label_en": "Netherlands (NL) — 64",
+                "count": 64,
+            },
+            {
+                "code": "FI",
+                "name_fa": "فنلاند",
+                "name_en": "Finland",
+                "label_fa": "فنلاند (FI) — 42",
+                "label_en": "Finland (FI) — 42",
+                "count": 42,
+            },
+            {
+                "code": "US",
+                "name_fa": "آمریکا",
+                "name_en": "United States",
+                "label_fa": "آمریکا (US) — 49",
+                "label_en": "United States (US) — 49",
+                "count": 49,
+            },
+        ]
         self._settings: dict = {
             "ui_language": "fa",
             "system_proxy": True,
@@ -203,6 +247,8 @@ class DemoDpiController(BackendControllerAdapter):
             "tun_badge": "OFF",
             "autopilot": True,
             "autopilot_enabled": True,
+            "auto_mode_enabled": True,
+            "selected_auto_location": "ALL",
             "routing_mode": "bypass_ir",
             "block_quic": True,
             "remote_dns": "https://1.1.1.1/dns-query",
@@ -417,6 +463,55 @@ class DemoDpiController(BackendControllerAdapter):
     def get_verified_outputs(self) -> list:
         return [dict(x) for x in self._verified_outputs]
 
+    def get_auto_locations(self) -> list:
+        return [dict(loc) for loc in self._auto_locations]
+
+    def get_selected_auto_location(self) -> str:
+        return str(self._selected_auto_location or "ALL").upper()
+
+    def set_auto_location(self, code: str) -> None:
+        norm = str(code or "ALL").strip().upper()
+        self._selected_auto_location = norm
+        self._settings["selected_auto_location"] = norm
+        self.auto_locations_updated.emit(self.get_auto_locations(), norm)
+        self._emit_log(f"Auto-connect target location set to '{norm}'.")
+
+    def refresh_auto_pool(self) -> None:
+        self.task_progress.emit(True, 45, "Syncing auto-connect locations from repository...")
+        QTimer.singleShot(
+            380,
+            lambda: (
+                self.auto_locations_updated.emit(self.get_auto_locations(), self.get_selected_auto_location()),
+                self.task_progress.emit(False, 100, ""),
+            ),
+        )
+        self._emit_log("Synced auto-connect pool locations.")
+
+    def hunt_subscription_and_connect(self, sub_url_or_title: str = "", title: str = "") -> None:
+        target = str(sub_url_or_title or "").strip()
+        grp_title = strip_emojis(str(title or "").strip()) or "Sub-Hunt"
+        if target.startswith("http://") or target.startswith("https://"):
+            existing_titles = {str(s.get("title") or "") for s in self._subscriptions if isinstance(s, dict)}
+            if grp_title not in existing_titles:
+                self._subscriptions.append({"title": grp_title, "url": target})
+                self.subscriptions_updated.emit(self.get_subscriptions())
+            group_filter = ""
+        else:
+            group_filter = target
+
+        self._settings["autopilot"] = True
+        self._settings["autopilot_enabled"] = True
+        self._settings["auto_mode_enabled"] = True
+        self.settings_updated.emit(dict(self._settings))
+        self.start_lab_scan(
+            scope="group" if group_filter else "selected",
+            uid_list=None,
+            group_tag=group_filter,
+            target_vector="ALL",
+            check_gemini=True,
+            auto_connect=True,
+        )
+
     def get_vectors(self) -> list:
         return [dict(v) for v in self._vectors]
 
@@ -433,9 +528,13 @@ class DemoDpiController(BackendControllerAdapter):
         if isinstance(new_dict, dict):
             self._settings.update(new_dict)
             if "autopilot_enabled" in new_dict:
-                self._settings["autopilot"] = bool(new_dict["autopilot_enabled"])
+                ap_v = bool(new_dict["autopilot_enabled"])
+                self._settings["autopilot"] = ap_v
+                self._settings["auto_mode_enabled"] = ap_v
             elif "autopilot" in new_dict:
-                self._settings["autopilot_enabled"] = bool(new_dict["autopilot"])
+                ap_v = bool(new_dict["autopilot"])
+                self._settings["autopilot_enabled"] = ap_v
+                self._settings["auto_mode_enabled"] = ap_v
             self._settings["tun_badge"] = "ON" if bool(self._settings.get("tun_enabled")) else "OFF"
             self.settings_updated.emit(dict(self._settings))
             self._emit_log(f"Updated {len(new_dict)} configuration parameter(s).")
@@ -443,10 +542,11 @@ class DemoDpiController(BackendControllerAdapter):
     def set_setting_value(self, key: str, value) -> None:
         k = str(key)
         self._settings[k] = value
-        if k == "autopilot_enabled":
-            self._settings["autopilot"] = bool(value)
-        elif k == "autopilot":
-            self._settings["autopilot_enabled"] = bool(value)
+        if k in ("autopilot_enabled", "auto_mode_enabled", "autopilot"):
+            ap_v = bool(value)
+            self._settings["autopilot"] = ap_v
+            self._settings["autopilot_enabled"] = ap_v
+            self._settings["auto_mode_enabled"] = ap_v
         elif k == "tun_enabled":
             self._settings["tun_badge"] = "ON" if bool(value) else "OFF"
         self.settings_updated.emit(dict(self._settings))
@@ -489,9 +589,16 @@ class DemoDpiController(BackendControllerAdapter):
         self._connected_since = None
         self._connect_step = 0
         ap_on = bool(self._settings.get("autopilot_enabled", True))
-        if (not uri) and ap_on and self._verified_outputs:
-            best = min(self._verified_outputs, key=lambda x: get_int(x, "ping_ms", 9999))
-            self._select_by_uid(str(best.get("uid") or ""))
+        if (not uri) and ap_on:
+            loc_filter = self.get_selected_auto_location()
+            if loc_filter != "ALL":
+                for idx, p in enumerate(self._profiles):
+                    if GeoFlagResolver.resolve_code(p) == loc_filter:
+                        self._selected_index = idx
+                        break
+            elif self._verified_outputs:
+                best = min(self._verified_outputs, key=lambda x: get_int(x, "ping_ms", 9999))
+                self._select_by_uid(str(best.get("uid") or ""))
         prof = self._active_profile()
         self._emit_log(f"Initiating tunnel to '{prof.get('name', 'Smart-Auto')}'...")
         self._step_connect()
@@ -503,6 +610,7 @@ class DemoDpiController(BackendControllerAdapter):
         self._phase = "IDLE"
         self._connected_since = None
         tun_en = bool(self._settings.get("tun_enabled", False))
+        ap_on = bool(self._settings.get("autopilot_enabled", True))
         self.task_progress.emit(False, 0, "")
         self.tun_status_changed.emit(tun_en, False, "TUN standby")
         self._emit_log("Probing cancelled." if was_probing else "Tunnel disconnected cleanly.")
@@ -515,7 +623,9 @@ class DemoDpiController(BackendControllerAdapter):
                 "is_connected": False,
                 "tun_enabled": tun_en,
                 "tun_badge": "ON" if tun_en else "OFF",
-                "autopilot_enabled": bool(self._settings.get("autopilot_enabled", True)),
+                "autopilot_enabled": ap_on,
+                "auto_mode_enabled": ap_on,
+                "selected_auto_location": self.get_selected_auto_location(),
                 "gemini_ready": False,
                 "selected_index": self.get_selected_index(),
                 "active_profile_uid": extract_profile_uid(prof, 0),
@@ -981,6 +1091,7 @@ class DemoDpiController(BackendControllerAdapter):
     def _step_connect(self) -> None:
         prof = self._active_profile()
         tun_en = bool(self._settings.get("tun_enabled", False))
+        ap_on = bool(self._settings.get("autopilot_enabled", True))
         stages = [
             "Selecting verified anti-DPI method...",
             "Applying TLS fragmentation & verifying 6s stream...",
@@ -995,7 +1106,9 @@ class DemoDpiController(BackendControllerAdapter):
                     "is_connected": False,
                     "tun_enabled": tun_en,
                     "tun_badge": "ON" if tun_en else "OFF",
-                    "autopilot_enabled": bool(self._settings.get("autopilot_enabled", True)),
+                    "autopilot_enabled": ap_on,
+                    "auto_mode_enabled": ap_on,
+                    "selected_auto_location": self.get_selected_auto_location(),
                     "gemini_ready": False,
                     "egress_country_code": "",
                     "egress_country": "",
@@ -1055,6 +1168,8 @@ class DemoDpiController(BackendControllerAdapter):
                 "tun_enabled": tun_en,
                 "tun_badge": "ON" if tun_en else "OFF",
                 "autopilot_enabled": ap_on,
+                "auto_mode_enabled": ap_on,
+                "selected_auto_location": self.get_selected_auto_location(),
                 "selected_index": self.get_selected_index(),
                 "active_profile_uid": extract_profile_uid(prof, 0),
                 "egress_ip": egress,
@@ -1187,6 +1302,8 @@ class AlanMainWindow(QMainWindow):
             "tun_badge": "OFF",
             "autopilot": True,
             "autopilot_enabled": True,
+            "auto_mode_enabled": True,
+            "selected_auto_location": "ALL",
             "fingerprint": "custom_poly",
             "routing_mode": "bypass_ir",
             "sub_auto_update_hours": 6,
@@ -1204,8 +1321,8 @@ class AlanMainWindow(QMainWindow):
             | Qt.WindowType.WindowCloseButtonHint
             | Qt.WindowType.WindowSystemMenuHint
         )
-        self.setMinimumSize(1100, 680)
-        self.resize(1260, 790)
+        self.setMinimumSize(1120, 680)
+        self.resize(1280, 790)
 
         self.shell = QFrame()
         self.shell.setObjectName("MainShell")
@@ -1408,6 +1525,8 @@ class AlanMainWindow(QMainWindow):
         self.home_page.connect_triggered.connect(self._handle_home_connect)
         self.home_page.disconnect_triggered.connect(self._handle_disconnect_request)
         self.home_page.output_selection_changed.connect(self._handle_home_output_selected)
+        self.home_page.auto_location_changed.connect(self._handle_auto_location_changed)
+        self.home_page.refresh_auto_pool_requested.connect(self._handle_refresh_auto_pool)
         self.home_page.ping_verified_requested.connect(lambda: self._call_ctrl("ping_verified_outputs"))
         self.home_page.clear_verified_requested.connect(self._handle_clear_verified)
         self.home_page.system_proxy_toggled.connect(self._handle_system_proxy_toggled)
@@ -1427,6 +1546,7 @@ class AlanMainWindow(QMainWindow):
         self.configs_page.export_verified_requested.connect(self._handle_export_verified)
         self.configs_page.send_batch_to_lab_requested.connect(self._route_batch_to_lab)
         self.configs_page.manage_subs_requested.connect(self._open_subs_dialog)
+        self.configs_page.hunt_subscription_requested.connect(self._handle_hunt_subscription_and_connect)
 
         self.lab_page.start_lab_scan_requested.connect(self._handle_start_lab_scan)
         self.lab_page.start_clean_ip_requested.connect(lambda port: self._call_ctrl("start_clean_ip_scan", port))
@@ -1445,6 +1565,7 @@ class AlanMainWindow(QMainWindow):
             (("log_message", "log_emitted"), self.on_log_message),
             (("profiles_updated", "profiles_changed"), self.on_profiles_updated),
             (("verified_outputs_updated", "verified_outputs_changed"), self.on_verified_outputs_updated),
+            (("auto_locations_updated", "auto_locations_changed"), self.on_auto_locations_updated),
             (("settings_updated", "settings_changed"), self.on_settings_updated),
             (("subscriptions_updated", "subscriptions_changed"), self.on_subscriptions_updated),
             (("scan_row", "scan_row_emitted"), self.on_scan_row),
@@ -1491,6 +1612,14 @@ class AlanMainWindow(QMainWindow):
         if isinstance(verified, list):
             self.on_verified_outputs_updated(verified)
 
+        auto_locs = self._call_ctrl("get_auto_locations")
+        sel_auto_loc = self._call_ctrl("get_selected_auto_location")
+        if isinstance(auto_locs, list):
+            self.on_auto_locations_updated(
+                auto_locs,
+                str(sel_auto_loc or "ALL"),
+            )
+
         raw_settings = coerce_dict(self._call_ctrl("get_settings"))
         if raw_settings:
             lang_pref = str(raw_settings.get("ui_language") or raw_settings.get("language") or "")
@@ -1506,6 +1635,32 @@ class AlanMainWindow(QMainWindow):
         self.pages.setCurrentIndex(0)
         self.btn_home.setChecked(True)
 
+    def _handle_auto_location_changed(self, code: str) -> None:
+        norm = str(code or "ALL").strip().upper()
+        self._settings_cache["selected_auto_location"] = norm
+        fn = getattr(self.controller, "set_auto_location", None)
+        if callable(fn):
+            fn(norm)
+        else:
+            self._handle_single_setting("selected_auto_location", norm)
+
+    def _handle_refresh_auto_pool(self) -> None:
+        fn = getattr(self.controller, "refresh_auto_pool", None)
+        if callable(fn):
+            fn()
+
+    def _handle_hunt_subscription_and_connect(self, sub_url_or_title: str, title: str = "") -> None:
+        target = str(sub_url_or_title or "").strip()
+        if not target:
+            return
+        self._switch_to_home_tab()
+        fn = getattr(self.controller, "hunt_subscription_and_connect", None)
+        if callable(fn):
+            try:
+                fn(target, title)
+            except TypeError:
+                fn(target)
+
     def _handle_home_connect(self, output_key: str) -> None:
         if output_key and output_key not in (HomePage.SMART_AUTO_KEY, "__smart_pool__"):
             self._call_ctrl("select_config", output_key)
@@ -1516,8 +1671,12 @@ class AlanMainWindow(QMainWindow):
 
         ap_on = get_bool(
             self._settings_cache,
-            "autopilot_enabled",
-            get_bool(self._settings_cache, "autopilot", True),
+            "auto_mode_enabled",
+            get_bool(
+                self._settings_cache,
+                "autopilot_enabled",
+                get_bool(self._settings_cache, "autopilot", True),
+            ),
         )
         hunt_fn = getattr(self.controller, "hunt_best_and_connect", None)
         toggle_fn = getattr(self.controller, "toggle_connection", None)
@@ -1544,6 +1703,7 @@ class AlanMainWindow(QMainWindow):
         if not output_key or output_key in (HomePage.SMART_AUTO_KEY, "__smart_pool__"):
             self._handle_autopilot_toggled(True)
             return
+        self._settings_cache["auto_mode_enabled"] = False
         self._settings_cache["autopilot_enabled"] = False
         self._settings_cache["autopilot"] = False
         self._settings_cache["active_profile_uid"] = str(output_key)
@@ -1554,6 +1714,7 @@ class AlanMainWindow(QMainWindow):
 
     def _handle_autopilot_toggled(self, enabled: bool) -> None:
         state = bool(enabled)
+        self._settings_cache["auto_mode_enabled"] = state
         self._settings_cache["autopilot_enabled"] = state
         self._settings_cache["autopilot"] = state
         if not state:
@@ -1568,7 +1729,14 @@ class AlanMainWindow(QMainWindow):
         if callable(fn):
             fn("autopilot_enabled", state)
         else:
-            self._call_ctrl("update_settings", {"autopilot_enabled": state, "autopilot": state})
+            self._call_ctrl(
+                "update_settings",
+                {
+                    "auto_mode_enabled": state,
+                    "autopilot_enabled": state,
+                    "autopilot": state,
+                },
+            )
 
     def _handle_clear_verified(self) -> None:
         self._verified_cache.clear()
@@ -1638,6 +1806,7 @@ class AlanMainWindow(QMainWindow):
         merged["system_proxy"] = bool(self.home_page.sw_sys_proxy.isChecked())
         merged["tun_enabled"] = bool(self.home_page.sw_tun.isChecked())
         ap_state = bool(self.home_page.sw_autopilot.isChecked())
+        merged["auto_mode_enabled"] = ap_state
         merged["autopilot_enabled"] = ap_state
         merged["autopilot"] = ap_state
         self._settings_cache = merged
@@ -1740,6 +1909,7 @@ class AlanMainWindow(QMainWindow):
         dlg.auto_update_hours_changed.connect(
             lambda h: self._handle_single_setting("sub_auto_update_hours", int(h))
         )
+        dlg.hunt_subscription_requested.connect(self._handle_hunt_subscription_and_connect)
         dlg.exec()
         self._sub_dialog = None
 
@@ -1766,6 +1936,19 @@ class AlanMainWindow(QMainWindow):
     def _handle_connect_lab_winner(self, vector_id: str, target_uid: str) -> None:
         self._call_ctrl("apply_scanned_vector", vector_id, target_uid, True)
         self._switch_to_home_tab()
+
+    @Slot(list)
+    @Slot(list, str)
+    def on_auto_locations_updated(self, locations: list, selected_code: str = "") -> None:
+        code = str(selected_code or "").strip().upper()
+        if not code:
+            ctrl_code = self._call_ctrl("get_selected_auto_location")
+            code = str(ctrl_code or self._settings_cache.get("selected_auto_location") or "ALL").strip().upper()
+        self._settings_cache["selected_auto_location"] = code
+        self.home_page.on_auto_locations_updated(
+            locations if isinstance(locations, list) else [],
+            code,
+        )
 
     @Slot(dict)
     def on_telemetry_update(self, snapshot: dict) -> None:
@@ -1803,8 +1986,10 @@ class AlanMainWindow(QMainWindow):
             self._settings_cache["tun_enabled"] = tun_en
             self._settings_cache["tun_badge"] = tun_b
 
-        if "autopilot_enabled" in enriched:
-            ap_val = bool(enriched.get("autopilot_enabled"))
+        if ("auto_mode_enabled" in enriched) or ("autopilot_enabled" in enriched):
+            ap_key = "auto_mode_enabled" if ("auto_mode_enabled" in enriched) else "autopilot_enabled"
+            ap_val = bool(enriched.get(ap_key))
+            self._settings_cache["auto_mode_enabled"] = ap_val
             self._settings_cache["autopilot_enabled"] = ap_val
             self._settings_cache["autopilot"] = ap_val
 
@@ -1861,10 +2046,15 @@ class AlanMainWindow(QMainWindow):
             return
         if ("tun_enabled" in parsed) or ("tun_badge" in parsed):
             self._tun_signal_received = True
-        if ("autopilot_enabled" in parsed) and ("autopilot" not in parsed):
+        if ("auto_mode_enabled" in parsed) and ("autopilot_enabled" not in parsed):
+            parsed["autopilot_enabled"] = bool(parsed["auto_mode_enabled"])
+            parsed["autopilot"] = bool(parsed["auto_mode_enabled"])
+        elif ("autopilot_enabled" in parsed) and ("autopilot" not in parsed):
             parsed["autopilot"] = bool(parsed["autopilot_enabled"])
+            parsed["auto_mode_enabled"] = bool(parsed["autopilot_enabled"])
         elif ("autopilot" in parsed) and ("autopilot_enabled" not in parsed):
             parsed["autopilot_enabled"] = bool(parsed["autopilot"])
+            parsed["auto_mode_enabled"] = bool(parsed["autopilot"])
 
         cur_out = self.home_page.selected_output_key()
         if (

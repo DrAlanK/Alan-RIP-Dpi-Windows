@@ -13,7 +13,7 @@ from typing import Dict, List, Optional, Tuple
 
 from alan_dpi.engine.bridge import FullDuplexMutatorBridge
 from alan_dpi.engine.clean_ip import CleanIpScanner
-from alan_dpi.engine.models import EngineSettings, ProfileNode, find_vector
+from alan_dpi.engine.models import EngineSettings, LocationExtractor, ProfileNode, find_vector
 from alan_dpi.engine.verifier import TunnelStreamVerifier
 
 
@@ -315,7 +315,13 @@ class UriConfigCodec:
         return f"{proto}://{urllib.parse.quote(secret)}@{addr}:{port}?{q_str}#{urllib.parse.quote(name)}"
 
     @classmethod
-    def extract_profile_node(cls, uri: str, group_tag: str = "Manual", is_hidden: bool = False) -> ProfileNode:
+    def extract_profile_node(
+        cls,
+        uri: str,
+        group_tag: str = "Manual",
+        is_hidden: bool = False,
+        explicit_country: str = "",
+    ) -> ProfileNode:
         ed = cls.parse_to_editable(uri, group_tag=group_tag)
         proto_map = {
             "vless": "VLESS",
@@ -325,6 +331,7 @@ class UriConfigCodec:
             "socks": "SOCKS",
         }
         proto_label = proto_map.get(ed["protocol"], ed["protocol"].upper())
+        cc = LocationExtractor.extract_country_code(name=ed["name"], uri=uri, explicit_loc=explicit_country)
         return ProfileNode(
             uri=uri.strip(),
             name=ed["name"],
@@ -333,6 +340,7 @@ class UriConfigCodec:
             port=int(ed["port"]),
             sni=ed["sni"],
             group_tag=group_tag,
+            country_code=cc,
             is_hidden_pool=is_hidden,
         )
 
@@ -815,37 +823,37 @@ class XrayProcessDriver:
         results: Dict[str, Tuple[int, str]] = {}
         total = len(nodes)
         processed = 0
+        lazy_cdn_cache: Dict[int, str] = {}
+        cdn_lock = concurrent.futures.ThreadPoolExecutor(max_workers=1)
 
-        cdn_port_ips: Dict[int, str] = {}
-        if settings.auto_clean_ip:
-            cdn_ports = sorted({n.port for n in nodes if CleanIpScanner.is_cdn_eligible(n)})
-            for p_num in cdn_ports[:4]:
-                if (abort_check is not None) and abort_check():
-                    break
-                if shared_cdn_ip and (CleanIpScanner.fast_tcp_ping(shared_cdn_ip, p_num, timeout=1.2) >= 0):
-                    cdn_port_ips[p_num] = shared_cdn_ip
-                else:
-                    found = CleanIpScanner.discover_best_ips(port=p_num, top_n=1, sample_count=24)
-                    if found:
-                        cdn_port_ips[p_num] = found[0][0]
+        def _get_lazy_fallback_cdn_ip(port_num: int) -> str:
+            if port_num in lazy_cdn_cache:
+                return lazy_cdn_cache[port_num]
+            if shared_cdn_ip and (CleanIpScanner.fast_tcp_ping(shared_cdn_ip, port_num, timeout=1.2) >= 0):
+                lazy_cdn_cache[port_num] = shared_cdn_ip
+                return shared_cdn_ip
+            found = CleanIpScanner.discover_best_ips(port=port_num, top_n=1, sample_count=24)
+            ip_res = found[0][0] if found else ""
+            lazy_cdn_cache[port_num] = ip_res
+            return ip_res
 
         def _run_subchunk(sub_batch: List[ProfileNode]) -> Dict[str, Tuple[int, str]]:
             sub_res: Dict[str, Tuple[int, str]] = {}
 
             def _prep_endpoint(nd: ProfileNode) -> Tuple[ProfileNode, str]:
-                cands: List[str] = []
-                if nd.cached_clean_ip and (not CleanIpScanner.is_poisoned_ip(nd.cached_clean_ip)):
-                    cands.append(nd.cached_clean_ip)
-                if CleanIpScanner.is_cdn_eligible(nd) and (nd.port in cdn_port_ips):
-                    ip_c = cdn_port_ips[nd.port]
-                    if ip_c not in cands:
-                        cands.append(ip_c)
+                if not CleanIpScanner.is_cdn_eligible(nd):
+                    nd.cached_clean_ip = ""
                 orig_ip = CleanIpScanner.resolve_unpoisoned_ipv4(nd.original_host, timeout=1.5)
-                if orig_ip and (orig_ip not in cands):
-                    cands.append(orig_ip)
-                for ip_try in cands:
-                    if CleanIpScanner.fast_tcp_ping(ip_try, nd.port, timeout=1.5) >= 0:
-                        return nd, ip_try
+                if orig_ip and (not CleanIpScanner.is_poisoned_ip(orig_ip)):
+                    if CleanIpScanner.fast_tcp_ping(orig_ip, nd.port, timeout=1.5) >= 0:
+                        return nd, orig_ip
+                if nd.cached_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
+                    if CleanIpScanner.fast_tcp_ping(nd.cached_clean_ip, nd.port, timeout=1.4) >= 0:
+                        return nd, nd.cached_clean_ip
+                if settings.auto_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
+                    fb_ip = cdn_lock.submit(_get_lazy_fallback_cdn_ip, nd.port).result()
+                    if fb_ip and (CleanIpScanner.fast_tcp_ping(fb_ip, nd.port, timeout=1.4) >= 0):
+                        return nd, fb_ip
                 return nd, ""
 
             alive_pairs: List[Tuple[ProfileNode, str]] = []
@@ -864,7 +872,7 @@ class XrayProcessDriver:
             inbounds: List[dict] = []
             outbounds: List[dict] = []
             rules: List[dict] = []
-            probe_Entries: List[Tuple[ProfileNode, int, FullDuplexMutatorBridge, str, bool]] = []
+            probe_entries: List[Tuple[ProfileNode, int, FullDuplexMutatorBridge, str, bool]] = []
             tmp_proc: Optional[subprocess.Popen] = None
             tmp_cfg_path = ""
 
@@ -914,9 +922,9 @@ class XrayProcessDriver:
                     })
                     outbounds.append(ob)
                     rules.append({"type": "field", "inboundTag": [in_tag], "outboundTag": f"out-{idx}"})
-                    probe_Entries.append((node, h_port, br, ep_host, is_direct))
+                    probe_entries.append((node, h_port, br, ep_host, is_direct))
 
-                if not probe_Entries:
+                if not probe_entries:
                     return sub_res
 
                 fd, tmp_cfg_path = tempfile.mkstemp(prefix="ping_", suffix=".json", dir=self.configs_dir)
@@ -941,7 +949,7 @@ class XrayProcessDriver:
                     creationflags=flags,
                 )
 
-                first_hp = probe_Entries[0][1]
+                first_hp = probe_entries[0][1]
                 ready = False
                 wait_until = time.perf_counter() + 3.8
                 while time.perf_counter() < wait_until:
@@ -967,20 +975,22 @@ class XrayProcessDriver:
                     return sub_res
 
                 if not ready:
-                    for nd_item, _, _, _, _ in probe_Entries:
+                    for nd_item, _, _, _, _ in probe_entries:
                         sub_res[nd_item.uid] = (-1, "UNKNOWN")
                     return sub_res
 
                 def _probe_entry(entry: Tuple[ProfileNode, int, FullDuplexMutatorBridge, str, bool]) -> Tuple[str, int, str]:
                     nd, hp, br, ep_h, is_dir = entry
                     used_vec = br.active_vector.vector_id
+                    active_ep = ep_h
                     ok, rtt, _ = TunnelStreamVerifier.fast_probe(hp, timeout=4.0)
+
                     if (not ok) and (not is_dir):
                         for fb_vid in ("VEC-01", "VEC-20"):
                             if fb_vid == used_vec:
                                 continue
                             br.update_route(
-                                remote_host=ep_h,
+                                remote_host=active_ep,
                                 remote_port=nd.port,
                                 vector=find_vector(fb_vid),
                                 custom_stride=settings.forward_stride_bytes,
@@ -993,12 +1003,34 @@ class XrayProcessDriver:
                                 used_vec = fb_vid
                                 break
 
+                    if (not ok) and (not is_dir) and settings.auto_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
+                        fb_cdn_ip = cdn_lock.submit(_get_lazy_fallback_cdn_ip, nd.port).result()
+                        if fb_cdn_ip and (fb_cdn_ip != active_ep):
+                            for fb_vid in ("VEC-21", "VEC-01"):
+                                br.update_route(
+                                    remote_host=fb_cdn_ip,
+                                    remote_port=nd.port,
+                                    vector=find_vector(fb_vid),
+                                    custom_stride=settings.forward_stride_bytes,
+                                    jitter_bytes=settings.stride_jitter_bytes,
+                                    raw_passthrough=False,
+                                    flush_existing_pool=True,
+                                )
+                                ok, rtt, _ = TunnelStreamVerifier.fast_probe(hp, timeout=3.8)
+                                if ok:
+                                    used_vec = fb_vid
+                                    active_ep = fb_cdn_ip
+                                    break
+
                     if not ok:
                         return nd.uid, -1, "UNKNOWN"
 
                     nd.cached_vector_id = used_vec
-                    if CleanIpScanner.is_cdn_eligible(nd) and (ep_h != nd.original_host):
-                        nd.cached_clean_ip = ep_h
+                    orig_resolved = CleanIpScanner.resolve_unpoisoned_ipv4(nd.original_host, timeout=1.0)
+                    if active_ep in (nd.original_host, orig_resolved):
+                        nd.cached_clean_ip = ""
+                    elif CleanIpScanner.is_cdn_eligible(nd):
+                        nd.cached_clean_ip = active_ep
 
                     gem_stat = nd.gemini_status if (nd.gemini_status == "OK") else "UNKNOWN"
                     if check_gemini:
@@ -1006,8 +1038,8 @@ class XrayProcessDriver:
                         gem_stat = "OK" if g_ok else "BLOCKED"
                     return nd.uid, rtt, gem_stat
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=len(probe_Entries)) as ex_pool:
-                    for uid_v, rtt_v, gem_v in ex_pool.map(_probe_entry, probe_Entries):
+                with concurrent.futures.ThreadPoolExecutor(max_workers=len(probe_entries)) as ex_pool:
+                    for uid_v, rtt_v, gem_v in ex_pool.map(_probe_entry, probe_entries):
                         sub_res[uid_v] = (rtt_v, gem_v)
 
                 return sub_res
@@ -1029,22 +1061,25 @@ class XrayProcessDriver:
                     except Exception:
                         pass
 
-        step_sz = max(1, int(chunk_size))
-        for start in range(0, total, step_sz):
-            if (abort_check is not None) and abort_check():
-                break
-            batch = nodes[start : start + step_sz]
-            chunk_out = _run_subchunk(batch)
-            results.update(chunk_out)
-            if on_chunk_done is not None:
-                try:
-                    on_chunk_done(chunk_out)
-                except Exception:
-                    pass
-            processed += len(batch)
-            if progress_cb is not None:
-                pct = min(99, int((processed / max(1, total)) * 100))
-                progress_cb(pct, f"پینگ واقعی تونل ({processed}/{total})...")
+        try:
+            step_sz = max(1, int(chunk_size))
+            for start in range(0, total, step_sz):
+                if (abort_check is not None) and abort_check():
+                    break
+                batch = nodes[start : start + step_sz]
+                chunk_out = _run_subchunk(batch)
+                results.update(chunk_out)
+                if on_chunk_done is not None:
+                    try:
+                        on_chunk_done(chunk_out)
+                    except Exception:
+                        pass
+                processed += len(batch)
+                if progress_cb is not None:
+                    pct = min(99, int((processed / max(1, total)) * 100))
+                    progress_cb(pct, f"پینگ واقعی تونل ({processed}/{total})...")
+        finally:
+            cdn_lock.shutdown(wait=False)
 
         return results
 
