@@ -1,0 +1,100 @@
+name: Build & Publish Windows Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release Version'
+        required: true
+        default: '1.3.0'
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Download Xray-core & Wintun into core/
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "core" | Out-Null
+
+          Write-Host "Downloading latest Xray-windows-64.zip..."
+          Invoke-WebRequest -Uri "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip" -OutFile "xray.zip"
+          Expand-Archive -Path "xray.zip" -DestinationPath "core" -Force
+          Remove-Item "xray.zip" -Force
+
+          Write-Host "Downloading wintun.dll (amd64)..."
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile "wintun.zip"
+          Expand-Archive -Path "wintun.zip" -DestinationPath "wintun_tmp" -Force
+          Copy-Item "wintun_tmp/wintun/bin/amd64/wintun.dll" -Destination "core/wintun.dll" -Force
+          Remove-Item "wintun.zip", "wintun_tmp" -Recurse -Force
+
+      - name: Inject Optional Secret Auto-Pool URL
+        if: env.AUTO_POOL_URL != ''
+        env:
+          AUTO_POOL_URL: ${{ secrets.AUTO_POOL_URL }}
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path "configs" | Out-Null
+          [System.IO.File]::WriteAllText("configs/.auto_pool_url", $env:AUTO_POOL_URL.Trim(), [System.Text.UTF8Encoding]::new($false))
+
+      - name: Install Dependencies & Build Portable Package
+        shell: pwsh
+        run: |
+          $Ver = "${{ github.event.inputs.version }}"
+          if (-not $Ver) {
+            $Ver = ("${{ github.ref_name }}" -replace '^v', '')
+          }
+          if (-not $Ver) { $Ver = "1.3.0" }
+
+          python -m pip install --upgrade pip pyinstaller pillow requests PySide6
+          .\build_release.ps1 -Version $Ver
+
+      - name: Publish to GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $Ver = "${{ github.event.inputs.version }}"
+          if (-not $Ver) {
+            $Ver = ("${{ github.ref_name }}" -replace '^v', '')
+          }
+          if (-not $Ver) { $Ver = "1.3.0" }
+          $Tag = "v$Ver"
+
+          $Notes = @"
+          **Alan-RIP-Dpi v$Ver**
+
+          • اضافه شدن پراکسی تفکیکی اپ‌ها (Per-App Proxy) و لانچر ایزوله برنامه‌های هوش مصنوعی (بدون نیاز به TUN سیستم)
+          • اضافه شدن اسکنر موازی و سپر DoH DNS روی کل ویندوز با مکانیسم ضد مسمومیت و برش TLS
+          • معماری Origin-First برای تست اولویت‌دار هاست اصلی و پشتیبانی از PaaS (Railway و...)
+          • افزوده شدن شکارچی کامل لینک سابسکریپشن (Sub Hunter) و اتصال خودکار به رتبه ۱
+          • انتخابگر پویای لوکیشن در حالت اتصال خودکار منطبق با سرورهای مخزن
+          "@
+
+          git tag -f $Tag
+          git push -f origin $Tag
+
+          $ZipFile = "release/Alan-RIP-Dpi-v$Ver-windows-x64.zip"
+          $ShaFile = "release/Alan-RIP-Dpi-v$Ver-windows-x64.sha256"
+
+          gh release view $Tag >$null 2>&1
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $Tag $ZipFile $ShaFile --clobber
+            gh release edit $Tag --title "Alan-RIP-Dpi v$Ver" --notes $Notes --draft=false
+          } else {
+            gh release create $Tag $ZipFile $ShaFile --title "Alan-RIP-Dpi v$Ver" --notes $Notes
+          }
