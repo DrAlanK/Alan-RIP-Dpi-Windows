@@ -1,5 +1,7 @@
+import queue
+import threading
 from typing import Any, List, Optional
-from PySide6.QtCore import QObject, Qt, Signal
+from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from alan_dpi.engine.autopilot import AlanAutoPilotEngine
@@ -33,25 +35,68 @@ class AlanQtBackendController(QObject):
     task_progress_updated = Signal(bool, int, str)
     tun_status_changed = Signal(bool, bool, str)
     auto_locations_updated = Signal(list, str)
-    _quit_sig = Signal()
 
     def __init__(self, base_dir: str, parent: Optional[QObject] = None):
         super().__init__(parent)
+        self._ui_queue: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
+        self._ui_pump = QTimer(self)
+        self._ui_pump.setInterval(25)
+        self._ui_pump.timeout.connect(self._drain_ui_queue)
+        self._ui_pump.start()
+
         self.engine = AlanAutoPilotEngine(base_dir=base_dir)
-        self.engine.on_telemetry = self.telemetry_updated.emit
-        self.engine.on_log = self.log_emitted.emit
-        self.engine.on_profiles = self.profiles_updated.emit
-        self.engine.on_verified_outputs = self.verified_outputs_updated.emit
-        self.engine.on_settings = self.settings_updated.emit
-        self.engine.on_subscriptions = self.subscriptions_updated.emit
-        self.engine.on_scan_row = self.scan_row_emitted.emit
-        self.engine.on_scan_ranked = self.scan_results_ranked.emit
-        self.engine.on_scan_progress = self.scan_progress_updated.emit
-        self.engine.on_scan_state = self.scan_state_changed.emit
-        self.engine.on_task_progress = self.task_progress_updated.emit
-        self.engine.on_tun_status = self.tun_status_changed.emit
-        self._quit_sig.connect(self.quit_application, Qt.ConnectionType.QueuedConnection)
-        self.engine.on_request_quit = self._quit_sig.emit
+        self.engine.on_telemetry = lambda d: self._post_ui(self.telemetry_updated, d)
+        self.engine.on_log = lambda s: self._post_ui(self.log_emitted, s)
+        self.engine.on_profiles = lambda p, i: self._post_ui(self.profiles_updated, list(p), int(i))
+        self.engine.on_verified_outputs = lambda v: self._post_ui(self.verified_outputs_updated, list(v))
+        self.engine.on_settings = lambda s: self._post_ui(self.settings_updated, dict(s))
+        self.engine.on_subscriptions = lambda sb: self._post_ui(self.subscriptions_updated, list(sb))
+        self.engine.on_scan_row = lambda r: self._post_ui(self.scan_row_emitted, dict(r))
+        self.engine.on_scan_ranked = lambda rs: self._post_ui(self.scan_results_ranked, list(rs))
+        self.engine.on_scan_progress = lambda p, m: self._post_ui(self.scan_progress_updated, int(p), str(m))
+        self.engine.on_scan_state = lambda b, m: self._post_ui(self.scan_state_changed, bool(b), str(m))
+        self.engine.on_task_progress = lambda a, p, m: self._post_ui(self.task_progress_updated, bool(a), int(p), str(m))
+        self.engine.on_tun_status = lambda e, a, d: self._post_ui(self.tun_status_changed, bool(e), bool(a), str(d))
+        self.engine.on_auto_locations = lambda locs, sel: self._post_ui(self.auto_locations_updated, list(locs), str(sel))
+        self.engine.on_request_quit = lambda: self._ui_queue.put(("__QUIT__", ()))
+
+    def _post_ui(self, sig, *args):
+        self._ui_queue.put((sig, args))
+
+    def _drain_ui_queue(self):
+        for _ in range(80):
+            try:
+                sig, args = self._ui_queue.get_nowait()
+            except queue.Empty:
+                break
+            if sig == "__QUIT__":
+                self.quit_application()
+                return
+            try:
+                sig.emit(*args)
+            except Exception as exc:
+                print(f"[UI Signal Warning] {exc}")
+
+    def discover_system_apps(self) -> list:
+        return self.engine.discover_system_apps()
+
+    def launch_tunneled_app(self, exe_path_or_name: str, extra_args: str = "") -> tuple:
+        return self.engine.launch_tunneled_app(exe_path_or_name, extra_args=extra_args)
+
+    def get_doh_repositories(self) -> list:
+        return self.engine.get_doh_repositories()
+
+    def add_doh_custom(self, url_or_text: str, title: str = "Custom DoH") -> int:
+        return self.engine.add_doh_custom(url_or_text, title=title)
+
+    def start_doh_scan(self):
+        self.engine.start_doh_scan()
+
+    def apply_doh_to_tunnel_dns(self, doh_url: str):
+        self.engine.apply_doh_to_tunnel_dns(doh_url)
+
+    def toggle_system_doh_veil(self, enabled: bool, doh_url: str = "") -> tuple:
+        return self.engine.toggle_system_doh_veil(bool(enabled), doh_url=str(doh_url or ""))
 
     def get_auto_locations(self) -> list:
         return self.engine.get_available_auto_locations()
@@ -63,7 +108,6 @@ class AlanQtBackendController(QObject):
         self.engine.set_auto_location(str(location_code or "ALL"))
 
     def refresh_auto_pool(self):
-        import threading
         threading.Thread(target=self.engine._sync_hidden_auto_pool, daemon=True).start()
 
     def hunt_subscription_and_connect(self, sub_url_or_title: Any = "", title: str = ""):
@@ -80,6 +124,9 @@ class AlanQtBackendController(QObject):
 
     def get_settings(self) -> dict:
         return self.engine.get_settings_as_dict()
+
+    def get_telemetry_snapshot(self) -> dict:
+        return self.engine.get_telemetry_snapshot()
 
     def update_settings(self, new_dict: dict):
         self.engine.update_settings(new_dict)
@@ -260,10 +307,12 @@ class AlanQtBackendController(QObject):
         self.engine.connect_scanned_profile(target_index_or_uid, vector_id=vector_id, clean_ip=clean_ip)
 
     def quit_application(self):
+        self._ui_pump.stop()
         self.engine.shutdown()
         app = QApplication.instance()
         if app is not None:
             app.quit()
 
     def shutdown(self):
+        self._ui_pump.stop()
         self.engine.shutdown()

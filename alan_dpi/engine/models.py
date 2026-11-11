@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 
 
 APP_NAME = "Alan-RIP-Dpi"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.3.0"
 
 
 COUNTRY_METADATA: Dict[str, Tuple[str, str]] = {
@@ -293,6 +293,11 @@ class EngineSettings:
     sub_auto_update_hours: int = 6
 
     routing_mode: str = "bypass_ir"
+    per_app_mode: str = "off"
+    per_app_list: str = ""
+    per_app_isolate_system_proxy: bool = True
+    doh_shield_enabled: bool = False
+    active_doh_url: str = "https://cloudflare-dns.com/dns-query"
     block_quic: bool = True
     remote_dns: str = "1.1.1.1"
     domestic_dns: str = "178.22.122.100"
@@ -494,6 +499,8 @@ class TelemetrySnapshot:
     tun_enabled: bool = False
     tun_active: bool = False
     tun_badge: str = "OFF"
+    doh_shield_active: bool = False
+    per_app_mode: str = "off"
     system_proxy_enabled: bool = True
     auto_mode_enabled: bool = True
     preferred_auto_location: str = "ALL"

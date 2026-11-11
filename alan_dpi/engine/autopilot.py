@@ -1,11 +1,11 @@
-import hashlib
-import random
 import base64
 import concurrent.futures
 import copy
 import ctypes
+import hashlib
 import json
 import os
+import random
 import threading
 import time
 import urllib.parse
@@ -15,11 +15,12 @@ import requests
 
 from alan_dpi.engine.bridge import FullDuplexMutatorBridge
 from alan_dpi.engine.clean_ip import CleanIpScanner, SEED_CLEAN_IPS
+from alan_dpi.engine.doh_shield import DohVeilEngine
 from alan_dpi.engine.models import (
     BypassVector,
     EngineSettings,
-    LocationExtractor,
     EngineState,
+    LocationExtractor,
     ProfileNode,
     SubscriptionItem,
     TelemetrySnapshot,
@@ -30,6 +31,7 @@ from alan_dpi.engine.models import (
     format_byte_rate,
     format_uptime_hms,
 )
+from alan_dpi.engine.per_app_proxy import PerAppSplitGateway, WindowsProcessInspector
 from alan_dpi.engine.tun_manager import WindowsXrayTunManager, is_windows_admin, relaunch_as_admin
 from alan_dpi.engine.verifier import TunnelStreamVerifier
 from alan_dpi.engine.xray_driver import UriConfigCodec, XrayProcessDriver
@@ -65,6 +67,7 @@ CONNECTING_STATES = {
 }
 
 SETTING_KEY_ALIASES = {
+    "ui_language": "language",
     "clean_ip": "auto_clean_ip",
     "auto_clean": "auto_clean_ip",
     "youtube_6s": "require_youtube_6s",
@@ -77,7 +80,10 @@ SETTING_KEY_ALIASES = {
     "system_proxy": "system_proxy_enabled",
     "sys_proxy": "system_proxy_enabled",
     "autopilot": "autopilot_enabled",
+    "auto_mode_enabled": "autopilot_enabled",
     "auto_pool": "auto_pool_enabled",
+    "auto_pool_fallback": "auto_pool_enabled",
+    "selected_auto_location": "preferred_auto_location",
     "auto_location": "preferred_auto_location",
     "location": "preferred_auto_location",
     "tun": "tun_enabled",
@@ -159,6 +165,7 @@ class AlanAutoPilotEngine:
         self.subs_path = os.path.join(self.configs_dir, "subscriptions.json")
         self.verified_path = os.path.join(self.configs_dir, "verified_outputs.json")
         self.hidden_cache_path = os.path.join(self.configs_dir, ".pool_cache.dat")
+        self.pool_meta_path = os.path.join(self.configs_dir, ".pool_meta.json")
 
         self.on_telemetry = on_telemetry
         self.on_log = on_log
@@ -175,7 +182,6 @@ class AlanAutoPilotEngine:
         self.on_task_progress = on_task_progress
         self.on_tun_status = on_tun_status
         self.on_request_quit: Optional[Callable[[], None]] = None
-        self.pool_meta_path = os.path.join(self.configs_dir, '.pool_meta.json')
 
         self._state_lock = threading.RLock()
         self._repo_lock = threading.RLock()
@@ -193,6 +199,7 @@ class AlanAutoPilotEngine:
         if self.settings.tun_enabled and (not is_windows_admin()):
             self.settings.tun_enabled = False
             self._save_settings(self.settings)
+
         self.profiles: List[ProfileNode] = self._load_profiles()
         self.hidden_pool: List[ProfileNode] = self._load_hidden_pool_cache()
         self.verified_outputs: List[VerifiedOutputItem] = self._load_verified_outputs()
@@ -206,10 +213,11 @@ class AlanAutoPilotEngine:
         )
         self._persist_active_selection(save_disk=True)
 
-        self.tun = WindowsXrayTunManager(
-            core_dir=self.core_dir,
-            log_fn=self.emit_log,
-        )
+        self.doh_engine = DohVeilEngine(configs_dir=self.configs_dir, log_fn=self.emit_log)
+        self.per_app_gateway = PerAppSplitGateway(log_fn=self.emit_log)
+        self.per_app_gateway.start(preferred_port=self.settings.http_port + 2)
+
+        self.tun = WindowsXrayTunManager(core_dir=self.core_dir, log_fn=self.emit_log)
         self.bridge = FullDuplexMutatorBridge(
             listen_port=self.settings.bridge_port,
             log_fn=self.emit_log,
@@ -222,6 +230,7 @@ class AlanAutoPilotEngine:
             configs_dir=self.configs_dir,
             log_fn=self.emit_log,
         )
+        self._sync_per_app_gateway()
 
         self._active_runtime_node: Optional[ProfileNode] = None
         self._active_runtime_vec: BypassVector = VECTOR_REGISTRY[0]
@@ -232,6 +241,118 @@ class AlanAutoPilotEngine:
         threading.Thread(target=self._telemetry_ticker_loop, daemon=True).start()
         threading.Thread(target=self._self_healing_watchdog_loop, daemon=True).start()
         threading.Thread(target=self._sync_hidden_auto_pool, daemon=True).start()
+
+    def _parse_per_app_list(self) -> List[str]:
+        raw = self.settings.per_app_list or ""
+        if isinstance(raw, list):
+            return [str(x).strip() for x in raw if str(x).strip()]
+        return [
+            x.strip()
+            for x in str(raw).replace(";", "\n").replace(",", "\n").splitlines()
+            if x.strip()
+        ]
+
+    def _effective_system_proxy_port(self) -> int:
+        p_mode = (self.settings.per_app_mode or "off").strip().lower()
+        app_items = self._parse_per_app_list()
+        if (p_mode in ("include", "exclude", "only_selected", "bypass_selected")) and app_items and (self.per_app_gateway.listen_port > 0):
+            return self.per_app_gateway.listen_port
+        return self.xray.active_http_port
+
+    def _should_enable_global_wininet_proxy(self) -> bool:
+        return bool(self.settings.system_proxy_enabled)
+
+    def _sync_per_app_gateway(self):
+        self.per_app_gateway.configure(
+            mode=self.settings.per_app_mode,
+            app_list=self._parse_per_app_list(),
+            upstream_http_port=self.xray.active_http_port,
+            upstream_socks_port=self.xray.active_socks_port,
+        )
+
+    def discover_system_apps(self) -> List[dict]:
+        return WindowsProcessInspector.discover_user_applications()
+
+    def launch_tunneled_app(self, exe_path_or_name: str, extra_args: str = "") -> Tuple[bool, str]:
+        base_exe = os.path.basename(str(exe_path_or_name or "").strip().strip('"'))
+        if base_exe:
+            cur_list = self._parse_per_app_list()
+            if base_exe.lower() not in {x.lower() for x in cur_list}:
+                cur_list.append(base_exe)
+                self.settings.per_app_list = "\n".join(cur_list)
+                self._save_settings(self.settings)
+                self._notify_settings_updated()
+        self._sync_per_app_gateway()
+        ok, msg = PerAppSplitGateway.launch_app_through_tunnel(
+            exe_path_or_name=exe_path_or_name,
+            http_port=self.xray.active_http_port,
+            socks_port=self.xray.active_socks_port,
+            extra_args=extra_args,
+            restart_if_running=True,
+        )
+        self.emit_log(f"[PerApp] {msg}")
+        return ok, msg
+
+    def get_doh_repositories(self) -> List[dict]:
+        return self.doh_engine.get_all_doh_Visual_list()
+
+    def add_doh_custom(self, url_or_text: str, title: str = "Custom DoH") -> int:
+        return self.doh_engine.add_doh_entries(url_or_text, title=title)
+
+    def start_doh_scan(self):
+        with self._state_lock:
+            self._op_generation += 1
+            gen_id = self._op_generation
+            self._scan_abort_flag = False
+            self._task_abort_flag = False
+
+        def _doh_worker():
+            try:
+                self._emit_scan_state(True, "در حال اسکن موازی سرورهای DoH ضد تحریم و فیلتر...")
+                ranked = self.doh_engine.scan_doh_repositories(
+                    on_row_cb=self._emit_scan_row,
+                    progress_cb=self._emit_scan_progress,
+                    abort_check=lambda: self._is_op_cancelled(gen_id),
+                )
+                if self._is_op_cancelled(gen_id):
+                    return
+                self._emit_scan_ranked(ranked)
+                ok_cnt = sum(1 for r in ranked if r.get("verified"))
+                self._emit_scan_progress(100, f"{ok_cnt} سرور DoH سالم و بدون مسمومیت یافت شد")
+                self._emit_scan_state(False, f"اسکن DoH پایان یافت ({ok_cnt} سرور سالم)")
+            except Exception as exc:
+                self.emit_log(f"[DoH Scan] Error: {exc}")
+                self._emit_scan_state(False, f"خطا در اسکن DoH: {exc}")
+
+        self._worker_thread = threading.Thread(target=_doh_worker, daemon=True)
+        self._worker_thread.start()
+
+    def apply_doh_to_tunnel_dns(self, doh_url: str):
+        clean_u = (doh_url or "").strip()
+        if not clean_u:
+            return
+        self.update_settings({"remote_dns": clean_u, "active_doh_url": clean_u})
+        self.emit_log(f"[DoH] Tunnel Remote DNS updated to: {clean_u}")
+        self._emit_task_progress(False, 100, f"سرور DoH روی مسیریابی تونل تنظیم شد: {clean_u}")
+
+    def toggle_system_doh_veil(self, enabled: bool, doh_url: str = "") -> Tuple[bool, str]:
+        target_u = (doh_url or self.settings.active_doh_url or self.settings.remote_dns or "https://cloudflare-dns.com/dns-query").strip()
+        if enabled:
+            ok, msg = self.doh_engine.activate_system_doh_veil(target_u)
+            self.settings.doh_shield_enabled = ok
+            if ok:
+                self.settings.active_doh_url = target_u
+            self._save_settings(self.settings)
+            self._notify_settings_updated()
+            self._push_telemetry()
+            return ok, msg
+        else:
+            ok, msg = self.doh_engine.stop_system_doh_veil()
+            self.settings.doh_shield_enabled = False
+            self._save_settings(self.settings)
+            self._notify_settings_updated()
+            self._push_telemetry()
+            return ok, msg
 
     @staticmethod
     def _replace_uri_endpoint_ip(uri: str, new_ip: str) -> str:
@@ -266,7 +387,7 @@ class AlanAutoPilotEngine:
             group_tag=node.group_tag,
             preferred_vec=node.cached_vector_id or "AUTO",
         )
-        if node.cached_clean_ip:
+        if node.cached_clean_ip and CleanIpScanner.is_cdn_eligible(node):
             if not ed.get("sni"):
                 ed["sni"] = node.original_host
             ed["address"] = node.cached_clean_ip
@@ -460,7 +581,7 @@ class AlanAutoPilotEngine:
             return [direct_vec]
 
         if "security=reality" in uri_low:
-            frag_subset = [v for v in base_vectors if v.family in ("HYBRID", "ENVELOPE", "FRAGMENT")][:3]
+            frag_subset = [v for v in base_vectors if v.family in ("COALESCE", "FRAGMENT")][:3]
             return [direct_vec] + frag_subset
 
         is_tunnel_or_plain = (
@@ -578,7 +699,8 @@ class AlanAutoPilotEngine:
         with self._state_lock:
             self.snapshot.state = state.value
             self.snapshot.tun_enabled = self.settings.tun_enabled
-            self.snapshot.tun_active = self.tun.active
+            self.snapshot.tun_active = self.tun.active or (self.settings.tun_enabled and is_windows_admin())
+            self.snapshot.tun_badge = "ON" if (self.settings.tun_enabled and is_windows_admin()) else "OFF"
             self.snapshot.system_proxy_enabled = self.settings.system_proxy_enabled
             self.snapshot.selected_index = max(0, self.selected_index)
 
@@ -790,6 +912,27 @@ class AlanAutoPilotEngine:
                 pass
         return []
 
+    def _resolve_hidden_urls(self) -> List[str]:
+        urls: List[str] = []
+        for raw_u in HIDDEN_AUTO_SUB_URLS:
+            dec = _decode_hidden_url(raw_u)
+            if dec and (dec not in urls):
+                urls.append(dec)
+        env_u = _decode_hidden_url(os.environ.get("ALAN_AUTO_SUB_URL", ""))
+        if env_u and (env_u not in urls):
+            urls.append(env_u)
+        secret_file = os.path.join(self.configs_dir, ".auto_pool_url")
+        if os.path.exists(secret_file):
+            try:
+                with open(secret_file, "r", encoding="utf-8") as fh:
+                    for line in fh:
+                        du = _decode_hidden_url(line)
+                        if du and (du not in urls):
+                            urls.append(du)
+            except Exception:
+                pass
+        return urls
+
     def _sync_hidden_auto_pool(self):
         urls = self._resolve_hidden_urls()
         if not urls:
@@ -917,27 +1060,6 @@ class AlanAutoPilotEngine:
         if changed and (self.snapshot.is_connected or self.snapshot.is_connecting):
             self.request_connect()
 
-    def _resolve_hidden_urls(self) -> List[str]:
-        urls: List[str] = []
-        for raw_u in HIDDEN_AUTO_SUB_URLS:
-            dec = _decode_hidden_url(raw_u)
-            if dec and (dec not in urls):
-                urls.append(dec)
-        env_u = _decode_hidden_url(os.environ.get("ALAN_AUTO_SUB_URL", ""))
-        if env_u and (env_u not in urls):
-            urls.append(env_u)
-        secret_file = os.path.join(self.configs_dir, ".auto_pool_url")
-        if os.path.exists(secret_file):
-            try:
-                with open(secret_file, "r", encoding="utf-8") as fh:
-                    for line in fh:
-                        du = _decode_hidden_url(line)
-                        if du and (du not in urls):
-                            urls.append(du)
-            except Exception:
-                pass
-        return urls
-
     def get_profiles_as_dicts(self) -> List[dict]:
         return self._serialize_profiles()
 
@@ -954,8 +1076,9 @@ class AlanAutoPilotEngine:
     def set_system_proxy(self, enabled: bool):
         self.settings.system_proxy_enabled = bool(enabled)
         self._save_settings(self.settings)
+        self._sync_per_app_gateway()
         if self.snapshot.is_connected:
-            WindowsSystemProxy.apply(self.settings.system_proxy_enabled, self.xray.active_http_port)
+            WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
         self._notify_settings_updated()
         self._push_telemetry()
 
@@ -996,7 +1119,7 @@ class AlanAutoPilotEngine:
                 entry = meta.get(key)
                 if isinstance(entry, dict):
                     nd.cached_vector_id = str(entry.get("vec") or "")
-                    nd.cached_clean_ip = str(entry.get("ip") or "")
+                    nd.cached_clean_ip = str(entry.get("ip") or "") if CleanIpScanner.is_cdn_eligible(nd) else ""
                     nd.last_ping_ms = int(entry.get("ping") or -1)
                     if nd.last_ping_ms > 0:
                         nd.health_status = "VERIFIED"
@@ -1061,8 +1184,9 @@ class AlanAutoPilotEngine:
                         settings=self.settings,
                         enable_native_tun_inbound=False,
                     )
+                    self._sync_per_app_gateway()
                     if self.settings.system_proxy_enabled:
-                        WindowsSystemProxy.apply(True, self.xray.active_http_port)
+                        WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
                 self.snapshot.tun_badge = "OFF"
                 self._emit_tun_status(False, False, "OFF")
 
@@ -1115,6 +1239,9 @@ class AlanAutoPilotEngine:
         if clean_key == "preferred_auto_location":
             self.set_auto_location(str(value))
             return
+        if clean_key == "doh_shield_enabled":
+            self.toggle_system_doh_veil(bool(value))
+            return
         if clean_key in ("autopilot_enabled", "auto_pool_enabled"):
             auto_on = bool(value)
             if auto_on:
@@ -1147,6 +1274,8 @@ class AlanAutoPilotEngine:
             if raw_v is None:
                 continue
             mapped_k = SETTING_KEY_ALIASES.get(str(raw_k).strip(), str(raw_k).strip())
+            if isinstance(raw_v, list) and mapped_k in ("custom_direct_domains", "custom_proxy_domains", "custom_blocked_domains", "per_app_list"):
+                raw_v = "\n".join(str(x).strip() for x in raw_v if str(x).strip())
             normalized[mapped_k] = raw_v
 
         merged = self.settings.to_dict()
@@ -1160,17 +1289,19 @@ class AlanAutoPilotEngine:
         self._save_settings(self.settings)
         self.snapshot.tun_enabled = self.settings.tun_enabled
         self.snapshot.system_proxy_enabled = self.settings.system_proxy_enabled
+        self._sync_per_app_gateway()
 
         self.emit_log(
             f"[Settings] Applied (AutoCleanIP={self.settings.auto_clean_ip}, "
-            f"YT6s={self.settings.require_youtube_6s}, UploadCheck={self.settings.verify_upload_stream}, "
-            f"Routing={self.settings.routing_mode}, Mode={self.settings.engine_mode})"
+            f"PerApp={self.settings.per_app_mode}, Routing={self.settings.routing_mode}, "
+            f"Mode={self.settings.engine_mode})"
         )
 
         hot_reload_keys = {
             "routing_mode", "block_quic", "remote_dns", "domestic_dns",
             "custom_direct_domains", "custom_proxy_domains", "custom_blocked_domains",
             "fingerprint", "alpn_override", "mux_enabled", "mux_concurrency",
+            "per_app_mode", "per_app_list",
         }
         needs_xray_reload = any(k in normalized for k in hot_reload_keys)
 
@@ -1181,10 +1312,11 @@ class AlanAutoPilotEngine:
             if needs_xray_reload and (self._active_runtime_node is not None) and (not self.tun.active):
                 try:
                     self.xray.ensure_running(uri=self._active_runtime_node.uri, settings=self.settings)
+                    self._sync_per_app_gateway()
                 except Exception as exc:
                     self.emit_log(f"[Xray] Hot-reload warning: {exc}")
             if self.settings.system_proxy_enabled != prev_sys_proxy or needs_xray_reload:
-                WindowsSystemProxy.apply(self.settings.system_proxy_enabled, self.xray.active_http_port)
+                WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
 
         self._notify_settings_updated()
         self._push_telemetry()
@@ -1201,7 +1333,7 @@ class AlanAutoPilotEngine:
             group_tag=nd.group_tag,
             preferred_vec=nd.cached_vector_id or "AUTO",
         )
-        if nd.cached_clean_ip:
+        if nd.cached_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
             ed["address"] = nd.cached_clean_ip
         return ed
 
@@ -1211,7 +1343,7 @@ class AlanAutoPilotEngine:
             use_raw = bool(data.get("use_raw_uri", False))
             rebuilt_uri = raw_override if (use_raw and bool(raw_override)) else UriConfigCodec.build_uri_from_editable(data)
 
-            group = str(data.get("group_tag", "Manual")).strip() or "Manual"
+            group = str(data.get("group") or data.get("group_tag") or "Manual").strip() or "Manual"
             pref_vec = str(data.get("preferred_vector_id", "")).strip()
             if pref_vec == "AUTO":
                 pref_vec = ""
@@ -1650,14 +1782,14 @@ class AlanAutoPilotEngine:
             sel = max(0, min(self.selected_index, len(visible) - 1))
             targets = [visible[sel]] if only_selected else visible
             for node in targets:
-                if only_selected or CleanIpScanner.is_cdn_eligible(node):
+                if CleanIpScanner.is_cdn_eligible(node):
                     node.cached_clean_ip = ip_val
                     updated += 1
         if updated > 0:
             self._save_profiles(self.profiles)
             self._notify_profiles_updated()
-            self.emit_log(f"[Patch] Applied Clean IP {ip_val} onto {updated} profile(s).")
-            self._emit_task_progress(False, 100, f"آی‌پی تمیز {ip_val} روی {updated} کانفیگ وصله شد")
+            self.emit_log(f"[Patch] Applied Clean IP {ip_val} onto {updated} CDN-eligible profile(s).")
+            self._emit_task_progress(False, 100, f"آی‌پی تمیز {ip_val} روی {updated} کانفیگ CDN اعمال شد")
         return updated
 
     def apply_scanned_vector(self, vector_id: str, target_uid: str = "", connect_now: bool = False):
@@ -1743,6 +1875,7 @@ class AlanAutoPilotEngine:
                 ping_ms=ping_ms,
                 upload_kbps=upload_kbps,
                 gemini_status=node.gemini_status,
+                country_code=node.country_code,
                 group_tag=node.group_tag,
                 verified_ts=int(time.time()),
             )
@@ -2231,10 +2364,10 @@ class AlanAutoPilotEngine:
             self._abort_flag = False
 
         chosen_vec = (target_vector or "").strip().upper()
-        depth_Token = (scan_depth or "all").strip()
-        if depth_Token.upper().startswith("VEC-"):
-            chosen_vec = depth_Token.upper()
-            depth_Token = "single"
+        depth_token = (scan_depth or "all").strip()
+        if depth_token.upper().startswith("VEC-"):
+            chosen_vec = depth_token.upper()
+            depth_token = "single"
         elif chosen_vec in ("", "ALL", "AUTO", "همه", "همه متدها"):
             chosen_vec = "ALL"
 
@@ -2250,7 +2383,7 @@ class AlanAutoPilotEngine:
             sel = self.get_selected_index()
             targets = [visible[sel]] if (0 <= sel < len(visible)) else visible[:1]
 
-        if (len(targets) == 1) and (chosen_vec == "ALL") and (depth_Token.lower() in ("all", "full", "")):
+        if (len(targets) == 1) and (chosen_vec == "ALL") and (depth_token.lower() in ("all", "full", "")):
             idx = visible.index(targets[0])
             self._worker_thread = threading.Thread(
                 target=self._run_active_profile_matrix_scan,
@@ -2270,7 +2403,7 @@ class AlanAutoPilotEngine:
             self._worker_thread.start()
             return
 
-        effective_mode = chosen_vec if chosen_vec.startswith("VEC-") else depth_Token.lower()
+        effective_mode = chosen_vec if chosen_vec.startswith("VEC-") else depth_token.lower()
         self._worker_thread = threading.Thread(
             target=self._run_lab_batch_scan_task,
             args=(gen_id, targets, effective_mode, check_gemini, auto_connect),
@@ -2280,6 +2413,9 @@ class AlanAutoPilotEngine:
 
     def start_dedicated_scan(self, mode: str = "active_profile", target_index: Any = -1, options: Optional[dict] = None):
         opts = options if isinstance(options, dict) else {}
+        if mode == "doh_scan":
+            self.start_doh_scan()
+            return
         with self._state_lock:
             self._op_generation += 1
             gen_id = self._op_generation
@@ -2504,7 +2640,9 @@ class AlanAutoPilotEngine:
                             "scan_type": "lab",
                             "rank": 1,
                             "uid": nd.uid,
+                            "target_uid": nd.uid,
                             "item_id": vec.vector_id,
+                            "vector_id": vec.vector_id,
                             "bound_vector": vec.vector_id,
                             "title": f"{nd.name} [{vec.vector_id}]",
                             "profile_name": nd.name,
@@ -2514,9 +2652,11 @@ class AlanAutoPilotEngine:
                             "tcp_ms": f_ms,
                             "tunnel_ms": q_ms,
                             "upload_kbps": up_kbps,
+                            "upload_ok": up_kbps > 0,
                             "gemini_status": gem_label,
                             "gemini_ok": gem_label == "OK",
                             "status": "VERIFIED",
+                            "verified": True,
                             "score": score,
                             "detail": f"Up={up_kbps:.0f} KB/s | {vec.code_name}",
                         }
@@ -2649,7 +2789,9 @@ class AlanAutoPilotEngine:
                             "rank": 99,
                             "target_index": idx,
                             "uid": node.uid,
+                            "target_uid": node.uid,
                             "item_id": vec.vector_id,
+                            "vector_id": vec.vector_id,
                             "bound_vector": vec.vector_id,
                             "title": f"{vec.vector_id} • {vec.code_name}",
                             "profile_name": node.name,
@@ -2659,6 +2801,7 @@ class AlanAutoPilotEngine:
                             "tcp_ms": tcp_ms,
                             "tunnel_ms": -1,
                             "status": "BLOCKED",
+                            "verified": False,
                             "score": 0,
                             "detail": q_detail,
                         }
@@ -2691,7 +2834,9 @@ class AlanAutoPilotEngine:
                             "rank": 1,
                             "target_index": idx,
                             "uid": node.uid,
+                            "target_uid": node.uid,
                             "item_id": vec.vector_id,
+                            "vector_id": vec.vector_id,
                             "bound_vector": vec.vector_id,
                             "title": f"{vec.vector_id} • {vec.code_name}",
                             "profile_name": node.name,
@@ -2701,9 +2846,11 @@ class AlanAutoPilotEngine:
                             "tcp_ms": tcp_ms,
                             "tunnel_ms": f_ms,
                             "upload_kbps": f_up,
+                            "upload_ok": f_up > 0,
                             "gemini_status": gem_stat,
                             "gemini_ok": gem_stat == "OK",
                             "status": "VERIFIED",
+                            "verified": True,
                             "score": score,
                             "detail": f"Up={f_up:.0f} KB/s | {f_detail}",
                         }
@@ -2719,7 +2866,9 @@ class AlanAutoPilotEngine:
                             "rank": 50,
                             "target_index": idx,
                             "uid": node.uid,
+                            "target_uid": node.uid,
                             "item_id": vec.vector_id,
+                            "vector_id": vec.vector_id,
                             "bound_vector": vec.vector_id,
                             "title": f"{vec.vector_id} • {vec.code_name}",
                             "profile_name": node.name,
@@ -2729,6 +2878,7 @@ class AlanAutoPilotEngine:
                             "tcp_ms": tcp_ms,
                             "tunnel_ms": q_ms,
                             "status": "PARTIAL_OK",
+                            "verified": False,
                             "score": partial_score,
                             "detail": f"Initial {q_ms}ms OK ({f_detail})",
                         }
@@ -2827,6 +2977,48 @@ class AlanAutoPilotEngine:
         self.bridge.drop_active_connections()
         self.xray.stop()
 
+    def _filter_hidden_pool_by_location(self) -> Tuple[List[ProfileNode], str]:
+        loc_code = self.get_selected_auto_location()
+        with self._repo_lock:
+            pool_raw = list(self.hidden_pool)
+        if loc_code == "ALL":
+            return pool_raw, "ALL"
+        filtered = [n for n in pool_raw if (n.country_code or "").upper() == loc_code]
+        return filtered, loc_code
+
+    def _run_auto_repository_only_connect(self, gen_id: int):
+        if not self.hidden_pool:
+            self._sync_hidden_auto_pool()
+        repo_nodes, loc_code = self._filter_hidden_pool_by_location()
+
+        if not repo_nodes:
+            if loc_code != "ALL" and self.hidden_pool:
+                _, fa_n = LocationExtractor.get_country_names(loc_code)
+                self._set_state(
+                    EngineState.ERROR,
+                    f"لوکیشن {fa_n} ({loc_code}) در مخزن یافت نشد",
+                    "لوکیشن دیگری انتخاب کنید یا روی «همه لوکیشن‌ها» بگذارید",
+                    0,
+                )
+            else:
+                self._set_state(
+                    EngineState.ERROR,
+                    "مخزن خودکار در دسترس نیست",
+                    "عدم دریافت سرورهای خودکار؛ اتصال اینترنت را بررسی کنید",
+                    0,
+                )
+            return
+
+        prior_winners = [n for n in repo_nodes if (n.health_status == "VERIFIED") and n.cached_vector_id]
+        prior_winners.sort(key=lambda x: x.last_ping_ms if x.last_ping_ms > 0 else 99999)
+        for fast_nd in prior_winners[:2]:
+            if self._is_op_cancelled(gen_id):
+                return
+            if self._execute_autopilot_pipeline(gen_id, fast_nd, max_vectors=4, force_auto_vectors=True):
+                return
+
+        self._run_hunt_best_pipeline(gen_id)
+
     def request_connect(self, uri: str = ""):
         if self.snapshot.is_connecting and (not uri):
             self.request_disconnect()
@@ -2911,48 +3103,6 @@ class AlanAutoPilotEngine:
                 0,
             )
 
-    def _filter_hidden_pool_by_location(self) -> Tuple[List[ProfileNode], str]:
-        loc_code = self.get_selected_auto_location()
-        with self._repo_lock:
-            pool_raw = list(self.hidden_pool)
-        if loc_code == "ALL":
-            return pool_raw, "ALL"
-        filtered = [n for n in pool_raw if (n.country_code or "").upper() == loc_code]
-        return filtered, loc_code
-
-    def _run_auto_repository_only_connect(self, gen_id: int):
-        if not self.hidden_pool:
-            self._sync_hidden_auto_pool()
-        repo_nodes, loc_code = self._filter_hidden_pool_by_location()
-
-        if not repo_nodes:
-            if loc_code != "ALL" and self.hidden_pool:
-                _, fa_n = LocationExtractor.get_country_names(loc_code)
-                self._set_state(
-                    EngineState.ERROR,
-                    f"لوکیشن {fa_n} ({loc_code}) در مخزن یافت نشد",
-                    "لوکیشن دیگری انتخاب کنید یا روی «همه لوکیشن‌ها» بگذارید",
-                    0,
-                )
-            else:
-                self._set_state(
-                    EngineState.ERROR,
-                    "مخزن خودکار در دسترس نیست",
-                    "عدم دریافت سرورهای خودکار؛ اتصال اینترنت را بررسی کنید",
-                    0,
-                )
-            return
-
-        prior_winners = [n for n in repo_nodes if (n.health_status == "VERIFIED") and n.cached_vector_id]
-        prior_winners.sort(key=lambda x: x.last_ping_ms if x.last_ping_ms > 0 else 99999)
-        for fast_nd in prior_winners[:2]:
-            if self._is_op_cancelled(gen_id):
-                return
-            if self._execute_autopilot_pipeline(gen_id, fast_nd, max_vectors=4, force_auto_vectors=True):
-                return
-
-        self._run_hunt_best_pipeline(gen_id)
-
     def request_disconnect(self):
         with self._state_lock:
             self._op_generation += 1
@@ -2996,6 +3146,8 @@ class AlanAutoPilotEngine:
             self._scan_abort_flag = True
             self._task_abort_flag = True
         self.tun.stop()
+        self.per_app_gateway.stop()
+        self.doh_engine.stop_system_doh_veil()
         WindowsSystemProxy.apply(False, self.xray.active_http_port)
         self.bridge.stop()
         self.xray.stop()
@@ -3215,11 +3367,12 @@ class AlanAutoPilotEngine:
             self._save_profiles(self.profiles)
             self._notify_profiles_updated(save_selection=True)
 
+        self._sync_per_app_gateway()
         if self.settings.system_proxy_enabled:
-            WindowsSystemProxy.apply(True, self.xray.active_http_port)
+            WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
 
-        shown_ep = "Protected Smart Edge" if node.is_hidden_pool else f"{endpoint_ip}:{node.port}"
-        shown_name = "Alan Smart Auto-Server" if node.is_hidden_pool else node.name
+        shown_ep = f"Protected Edge ({node.country_code or 'GLOBAL'})" if node.is_hidden_pool else f"{endpoint_ip}:{node.port}"
+        shown_name = f"Alan Smart Auto ({node.country_code or 'GLOBAL'})" if node.is_hidden_pool else node.name
         shown_uid = "__SMART_AUTO__" if node.is_hidden_pool else node.uid
 
         with self._state_lock:
@@ -3252,7 +3405,7 @@ class AlanAutoPilotEngine:
                 time.sleep(0.35)
 
             geo = {"ip": "---", "country_code": "", "country_en": "Global", "country_fa": "مسیر جهانی"}
-            for attempt in range(2):
+            for _ in range(2):
                 if self._is_op_cancelled(gen_id) or (not self.snapshot.is_connected):
                     return
                 geo = TunnelStreamVerifier.resolve_egress_geo(http_port=self.xray.active_http_port, timeout=4.2)
@@ -3260,12 +3413,12 @@ class AlanAutoPilotEngine:
                     break
                 time.sleep(1.2)
 
-            g_ok, g_reason = TunnelStreamVerifier.check_gemini_access(http_port=self.xray.active_http_port, timeout=5.2, geo_hint=geo)
+            g_ok, _ = TunnelStreamVerifier.check_gemini_access(http_port=self.xray.active_http_port, timeout=5.2, geo_hint=geo)
             if (not self._is_op_cancelled(gen_id)) and self.snapshot.is_connected:
                 gem_str = "OK" if g_ok else "BLOCKED"
                 node.gemini_status = gem_str
                 ip_only = geo.get("ip", "---")
-                cc = geo.get("country_code", "")
+                cc = geo.get("country_code", "") or node.country_code
                 c_fa = geo.get("country_fa", "مسیر جهانی")
                 c_en = geo.get("country_en", "Global")
                 c_disp = c_fa if (self.settings.language == "fa") else c_en
@@ -3336,6 +3489,9 @@ class AlanAutoPilotEngine:
                 self.snapshot.tun_active = self.tun.active or (self.settings.tun_enabled and is_windows_admin())
                 self.snapshot.tun_badge = "ON" if (self.settings.tun_enabled and is_windows_admin()) else "OFF"
                 self.snapshot.auto_mode_enabled = self.is_auto_repo_mode()
+                self.snapshot.preferred_auto_location = self.get_selected_auto_location()
+                self.snapshot.doh_shield_active = self.doh_engine.veil_active
+                self.snapshot.per_app_mode = self.settings.per_app_mode
                 self.snapshot.system_proxy_enabled = self.settings.system_proxy_enabled
                 self.snapshot.selected_index = max(0, self.selected_index)
 
@@ -3378,7 +3534,11 @@ class AlanAutoPilotEngine:
                             gen_id = self._op_generation
                             self._abort_flag = False
                         self._set_state(EngineState.RECOVERING, "ترمیم خودکار مسیر...", "سوییچ خودکار به مسیر جایگزین", 35)
-                        target_fn = self._run_auto_repository_only_connect if self.is_auto_repo_mode() else (lambda g: self._run_single_user_node_connect(g, active_node))
+                        target_fn = (
+                            self._run_auto_repository_only_connect
+                            if self.is_auto_repo_mode()
+                            else (lambda g: self._run_single_user_node_connect(g, active_node))
+                        )
                         self._worker_thread = threading.Thread(
                             target=target_fn,
                             args=(gen_id,),

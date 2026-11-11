@@ -1550,6 +1550,10 @@ class AlanMainWindow(QMainWindow):
 
         self.lab_page.start_lab_scan_requested.connect(self._handle_start_lab_scan)
         self.lab_page.start_clean_ip_requested.connect(lambda port: self._call_ctrl("start_clean_ip_scan", port))
+        self.lab_page.start_doh_scan_requested.connect(lambda: self._call_ctrl("start_doh_scan"))
+        self.lab_page.add_doh_custom_requested.connect(self._handle_add_doh_custom)
+        self.lab_page.apply_doh_tunnel_requested.connect(lambda url: self._call_ctrl("apply_doh_to_tunnel_dns", url))
+        self.lab_page.toggle_doh_veil_requested.connect(self._handle_toggle_doh_veil)
         self.lab_page.stop_scanner_requested.connect(lambda: self._call_ctrl("stop_scanner"))
         self.lab_page.connect_winner_requested.connect(self._handle_connect_lab_winner)
         self.lab_page.apply_clean_ip_requested.connect(
@@ -1559,6 +1563,8 @@ class AlanMainWindow(QMainWindow):
 
         self.routing_page.setting_key_changed.connect(self._handle_single_setting)
         self.routing_page.settings_changed.connect(self._handle_bulk_settings)
+        self.routing_page.discover_apps_requested.connect(self._handle_discover_apps)
+        self.routing_page.launch_app_requested.connect(self._handle_launch_tunneled_app)
 
         signal_bindings = [
             (("telemetry_updated",), self.on_telemetry_update),
@@ -1627,9 +1633,43 @@ class AlanMainWindow(QMainWindow):
                 I18N.set_language(lang_pref)
             self.on_settings_updated(raw_settings)
 
+        doh_repos = self._call_ctrl("get_doh_repositories")
+        if isinstance(doh_repos, list):
+            self.lab_page.set_doh_repositories(doh_repos)
+
+        apps_list = self._call_ctrl("discover_system_apps")
+        if isinstance(apps_list, list):
+            self.routing_page.set_discovered_apps(apps_list)
+
         snap = self._call_ctrl("get_telemetry_snapshot")
         if isinstance(snap, dict):
             self.on_telemetry_update(snap)
+
+    def _handle_add_doh_custom(self, url_or_text: str) -> None:
+        self._call_ctrl("add_doh_custom", url_or_text)
+        doh_repos = self._call_ctrl("get_doh_repositories")
+        if isinstance(doh_repos, list):
+            self.lab_page._doh_rows.clear()
+            self.lab_page.set_doh_repositories(doh_repos)
+
+    def _handle_toggle_doh_veil(self, enabled: bool, doh_url: str) -> None:
+        res = self._call_ctrl("toggle_system_doh_veil", bool(enabled), str(doh_url or ""))
+        if isinstance(res, tuple) and len(res) >= 1:
+            actual_ok = bool(res[0])
+            self.lab_page.sync_doh_veil_state(actual_ok and bool(enabled), doh_url)
+        else:
+            self.lab_page.sync_doh_veil_state(bool(enabled), doh_url)
+
+    def _handle_discover_apps(self) -> None:
+        apps = self._call_ctrl("discover_system_apps")
+        if isinstance(apps, list):
+            self.routing_page.set_discovered_apps(apps)
+
+    def _handle_launch_tunneled_app(self, exe_path: str) -> None:
+        self._call_ctrl("launch_tunneled_app", exe_path)
+        raw_settings = coerce_dict(self._call_ctrl("get_settings"))
+        if raw_settings:
+            self.on_settings_updated(raw_settings)
 
     def _switch_to_home_tab(self) -> None:
         self.pages.setCurrentIndex(0)
@@ -1995,6 +2035,11 @@ class AlanMainWindow(QMainWindow):
 
         phase_key = "CONNECTING" if self._is_connecting else ("CONNECTED" if self._is_connected else "IDLE")
         self._sync_tray_state(phase_key)
+        if "doh_shield_active" in enriched:
+            self.lab_page.sync_doh_veil_state(
+                bool(enriched.get("doh_shield_active")),
+                str(self._settings_cache.get("active_doh_url") or ""),
+            )
         self.home_page.apply_telemetry(enriched)
 
     @Slot(str)

@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import (
@@ -2181,6 +2182,10 @@ class ConfigsPage(QWidget):
 class LabPage(QWidget):
     start_lab_scan_requested = Signal(str, list, str, str, bool, bool)
     start_clean_ip_requested = Signal(int)
+    start_doh_scan_requested = Signal()
+    add_doh_custom_requested = Signal(str)
+    apply_doh_tunnel_requested = Signal(str)
+    toggle_doh_veil_requested = Signal(bool, str)
     stop_scanner_requested = Signal()
     connect_winner_requested = Signal(str, str)
     apply_clean_ip_requested = Signal(str, bool)
@@ -2198,6 +2203,7 @@ class LabPage(QWidget):
         self._vectors: list = []
         self._lab_rows: list[dict] = []
         self._radar_rows: list[dict] = []
+        self._doh_rows: list[dict] = []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 12, 20, 14)
@@ -2215,7 +2221,13 @@ class LabPage(QWidget):
         hdr.addLayout(t_col, 1)
         root.addLayout(hdr)
 
-        self.mode_seg = SegmentedControl([I18N.t("lab_mode_vectors"), I18N.t("lab_mode_clean_ip")])
+        self.mode_seg = SegmentedControl(
+            [
+                I18N.t("lab_mode_vectors"),
+                I18N.t("lab_mode_clean_ip"),
+                I18N.t("lab_mode_doh"),
+            ]
+        )
         self.mode_seg.current_changed.connect(self._on_mode_switched)
         root.addWidget(self.mode_seg)
 
@@ -2301,7 +2313,7 @@ class LabPage(QWidget):
         lh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         lh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.lab_table.setColumnWidth(6, 130)
+        self.lab_table.setColumnWidth(6, 136)
         vec_vbox.addWidget(self.lab_table, 1)
 
         radar_page = QWidget()
@@ -2355,13 +2367,161 @@ class LabPage(QWidget):
         rh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         rad_vbox.addWidget(self.radar_table, 1)
 
+        doh_page = QWidget()
+        doh_vbox = QVBoxLayout(doh_page)
+        doh_vbox.setContentsMargins(0, 4, 0, 0)
+        doh_vbox.setSpacing(10)
+
+        self.doh_bar = NeuCard(mode="raised", radius=18.0, depth=5.0, pad=6.0)
+        doh_bar_vbox = QVBoxLayout(self.doh_bar)
+        doh_bar_vbox.setContentsMargins(18, 14, 18, 14)
+        doh_bar_vbox.setSpacing(10)
+
+        doh_r1 = QHBoxLayout()
+        doh_r1.setSpacing(8)
+        self.doh_input_edit = QLineEdit()
+        self.doh_input_edit.setPlaceholderText(I18N.t("doh_input_ph"))
+        enforce_english_ltr(self.doh_input_edit, mono_size=10)
+
+        self.btn_add_doh = ActionPillButton("plus", I18N.t("doh_add_btn"), variant="ghost")
+        self.btn_add_doh.clicked.connect(self._on_add_doh_clicked)
+
+        self.btn_run_doh = ActionPillButton("play", I18N.t("btn_start_doh"), variant="gold")
+        self.btn_run_doh.clicked.connect(self._on_run_or_stop_doh)
+
+        doh_r1.addWidget(self.doh_input_edit, 1)
+        doh_r1.addWidget(self.btn_add_doh)
+        doh_r1.addWidget(self.btn_run_doh)
+        doh_bar_vbox.addLayout(doh_r1)
+
+        doh_r2 = QHBoxLayout()
+        doh_r2.setSpacing(12)
+        self.lbl_doh_veil = QLabel(I18N.t("sw_doh_veil"))
+        self.lbl_doh_veil.setObjectName("SecondaryLabel")
+        self.sw_doh_veil = AnimatedToggleSwitch(checked=False)
+        self.sw_doh_veil.toggled.connect(self._on_doh_veil_toggled)
+        self.doh_veil_pill = QLabel("OFF")
+        self.doh_veil_pill.setObjectName("MutedPill")
+        enforce_english_ltr(self.doh_veil_pill, mono_size=9, bold=True)
+
+        self.active_doh_lbl = QLabel("https://cloudflare-dns.com/dns-query")
+        self.active_doh_lbl.setObjectName("MutedLabel")
+        enforce_english_ltr(self.active_doh_lbl, mono_size=9)
+
+        self.btn_apply_doh_tunnel = QPushButton(I18N.t("btn_apply_doh_tunnel"))
+        self.btn_apply_doh_tunnel.setObjectName("EmeraldBtn")
+        self.btn_apply_doh_tunnel.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_apply_doh_tunnel.clicked.connect(self._apply_selected_doh_to_tunnel)
+
+        doh_r2.addWidget(self.lbl_doh_veil)
+        doh_r2.addWidget(self.sw_doh_veil)
+        doh_r2.addWidget(self.doh_veil_pill)
+        doh_r2.addWidget(self.active_doh_lbl, 1)
+        doh_r2.addWidget(self.btn_apply_doh_tunnel)
+        doh_bar_vbox.addLayout(doh_r2)
+        doh_vbox.addWidget(self.doh_bar)
+
+        self.doh_table = QTableWidget(0, 6)
+        self.doh_table.setObjectName("VaultTable")
+        self.doh_table.setAlternatingRowColors(True)
+        self.doh_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.doh_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.doh_table.verticalHeader().setVisible(False)
+        dh = self.doh_table.horizontalHeader()
+        dh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        dh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        dh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        dh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        dh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        dh.setSectionResizeMode(5, QHeaderView.ResizeMode.Fixed)
+        self.doh_table.setColumnWidth(5, 136)
+        doh_vbox.addWidget(self.doh_table, 1)
+
         self.stack.addWidget(vec_page)
         self.stack.addWidget(radar_page)
+        self.stack.addWidget(doh_page)
 
         self._populate_scope_combo()
         self.set_vectors([])
         self._apply_table_headers()
         self._sync_scope_selectors()
+
+    def set_doh_repositories(self, repos: list) -> None:
+        if self._doh_rows:
+            return
+        self._doh_rows = [
+            {
+                "scan_type": "doh",
+                "rank": f"#{i + 1}",
+                "name": str(r.get("name") or "DoH"),
+                "url": str(r.get("url") or ""),
+                "category": str(r.get("category") or ""),
+                "ping_ms": -1,
+                "unblocks": str(r.get("category") or "---"),
+                "status": "READY",
+                "verified": True,
+            }
+            for i, r in enumerate(repos or [])
+            if isinstance(r, dict) and r.get("url")
+        ]
+        self._render_doh_table()
+
+    def sync_doh_veil_state(self, active: bool, doh_url: str = "") -> None:
+        set_switch_blocked(self.sw_doh_veil, bool(active))
+        self.doh_veil_pill.setText("ON" if active else "OFF")
+        obj = "EmeraldPill" if active else "MutedPill"
+        if self.doh_veil_pill.objectName() != obj:
+            self.doh_veil_pill.setObjectName(obj)
+            self.doh_veil_pill.style().unpolish(self.doh_veil_pill)
+            self.doh_veil_pill.style().polish(self.doh_veil_pill)
+        if doh_url:
+            self.active_doh_lbl.setText(str(doh_url))
+
+    def _selected_doh_url(self) -> str:
+        sel = self.doh_table.currentRow()
+        if sel < 0 and self.doh_table.rowCount() > 0:
+            sel = 0
+        if sel >= 0:
+            it = self.doh_table.item(sel, 2)
+            if it is not None and it.text().strip().startswith("https://"):
+                return it.text().strip()
+        txt = self.doh_input_edit.text().strip()
+        if txt.startswith("https://"):
+            return txt
+        return self.active_doh_lbl.text().strip() or "https://cloudflare-dns.com/dns-query"
+
+    def _on_add_doh_clicked(self) -> None:
+        txt = self.doh_input_edit.text().strip()
+        if not txt:
+            txt = QGuiApplication.clipboard().text().strip()
+        if txt:
+            self.add_doh_custom_requested.emit(txt)
+            self.doh_input_edit.clear()
+
+    def _on_run_or_stop_doh(self) -> None:
+        if self._is_running:
+            self.stop_scanner_requested.emit()
+            return
+        self._doh_rows.clear()
+        self._render_doh_table()
+        self.start_doh_scan_requested.emit()
+
+    def _on_doh_veil_toggled(self, checked: bool) -> None:
+        url = self._selected_doh_url()
+        self.toggle_doh_veil_requested.emit(bool(checked), url)
+
+    def _apply_selected_doh_to_tunnel(self) -> None:
+        url = self._selected_doh_url()
+        if url:
+            self.active_doh_lbl.setText(url)
+            self.apply_doh_tunnel_requested.emit(url)
+
+    def _activate_doh_row(self, doh_url: str) -> None:
+        if not doh_url:
+            return
+        self.active_doh_lbl.setText(doh_url)
+        self.apply_doh_tunnel_requested.emit(doh_url)
+        self.toggle_doh_veil_requested.emit(True, doh_url)
 
     def _populate_scope_combo(self) -> None:
         prev_scope = self.scope_combo.currentData() or "single"
@@ -2405,6 +2565,16 @@ class LabPage(QWidget):
                 I18N.t("radar_col_tls"),
                 I18N.t("radar_col_score"),
                 I18N.t("lab_col_status"),
+            ]
+        )
+        self.doh_table.setHorizontalHeaderLabels(
+            [
+                I18N.t("lab_col_rank"),
+                I18N.t("doh_col_name"),
+                I18N.t("doh_col_url"),
+                I18N.t("doh_col_ping"),
+                I18N.t("doh_col_unblocks"),
+                I18N.t("doh_col_action"),
             ]
         )
 
@@ -2495,13 +2665,26 @@ class LabPage(QWidget):
         if self._is_running:
             self.btn_run_lab.set_label_text(I18N.t("btn_stop_lab"))
             self.btn_run_radar.set_label_text(I18N.t("btn_stop_lab"))
+            self.btn_run_doh.set_label_text(I18N.t("btn_stop_lab"))
         else:
             self.btn_run_lab.set_label_text(I18N.t("btn_start_lab"))
             self.btn_run_radar.set_label_text(I18N.t("btn_start_radar"))
+            self.btn_run_doh.set_label_text(I18N.t("btn_start_doh"))
 
     def append_scan_row(self, row: dict) -> None:
         st_type = str(row.get("scan_type") or "").lower()
-        if st_type in ("clean_ip", "clean_ip_radar", "radar"):
+        if st_type == "doh":
+            url_key = str(row.get("url") or "")
+            replaced = False
+            for idx, existing in enumerate(self._doh_rows):
+                if str(existing.get("url") or "") == url_key and url_key:
+                    self._doh_rows[idx] = dict(row)
+                    replaced = True
+                    break
+            if not replaced:
+                self._doh_rows.append(dict(row))
+            self._render_doh_table()
+        elif st_type in ("clean_ip", "clean_ip_radar", "radar"):
             key = str(row.get("item_id") or row.get("ip") or row.get("endpoint") or "")
             replaced = False
             for idx, existing in enumerate(self._radar_rows):
@@ -2529,7 +2712,10 @@ class LabPage(QWidget):
         if not rows:
             return
         first_t = str(rows[0].get("scan_type") or "").lower()
-        if first_t in ("clean_ip", "clean_ip_radar", "radar"):
+        if first_t == "doh":
+            self._doh_rows = [dict(r) for r in rows]
+            self._render_doh_table()
+        elif first_t in ("clean_ip", "clean_ip_radar", "radar"):
             self._radar_rows = [dict(r) for r in rows]
             self._render_radar_table()
         else:
@@ -2555,7 +2741,7 @@ class LabPage(QWidget):
             mono = make_mono_font(10, bold=True)
 
             for r_idx, row in enumerate(shown):
-                self.lab_table.setRowHeight(r_idx, 40)
+                self.lab_table.setRowHeight(r_idx, 42)
                 is_ok = self._is_verified_row(row)
 
                 rank_str = str(row.get("rank") or f"#{r_idx + 1}")
@@ -2623,7 +2809,7 @@ class LabPage(QWidget):
                 )
                 cell_w = QWidget()
                 cl = QHBoxLayout(cell_w)
-                cl.setContentsMargins(6, 4, 6, 4)
+                cl.setContentsMargins(6, 3, 6, 3)
                 cl.addWidget(btn_conn)
                 self.lab_table.setCellWidget(r_idx, 6, cell_w)
         finally:
@@ -2665,6 +2851,64 @@ class LabPage(QWidget):
         finally:
             self.radar_table.setUpdatesEnabled(True)
 
+    def _render_doh_table(self) -> None:
+        self.doh_table.setUpdatesEnabled(False)
+        try:
+            self.doh_table.setRowCount(len(self._doh_rows))
+            mono = make_mono_font(10, bold=True)
+            mono_reg = make_mono_font(9, bold=False)
+
+            for idx, row in enumerate(self._doh_rows):
+                self.doh_table.setRowHeight(idx, 42)
+                is_ok = get_bool(row, "verified", False)
+                st = str(row.get("status") or "READY").upper()
+                url_str = str(row.get("url") or "")
+                name_str = strip_emojis(str(row.get("name") or f"DoH #{idx + 1}"))
+                ping = get_int(row, "ping_ms", -1)
+                unblocks = str(row.get("unblocks") or row.get("detail") or "---")
+
+                rk_it = QTableWidgetItem(str(row.get("rank") or f"#{idx + 1}"))
+                rk_it.setFont(mono)
+                rk_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.doh_table.setItem(idx, 0, rk_it)
+
+                nm_it = QTableWidgetItem(name_str)
+                nm_it.setFont(make_ui_font(10, QFont.Weight.Bold))
+                self.doh_table.setItem(idx, 1, nm_it)
+
+                url_it = QTableWidgetItem(url_str)
+                url_it.setFont(mono_reg)
+                url_it.setForeground(QColor(self._palette.cyan))
+                self.doh_table.setItem(idx, 2, url_it)
+
+                p_it = QTableWidgetItem(f"{ping} ms" if ping > 0 else "---")
+                p_it.setFont(mono)
+                p_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                p_it.setForeground(
+                    QColor(self._palette.emerald) if ping > 0 else QColor(self._palette.text_muted)
+                )
+                self.doh_table.setItem(idx, 3, p_it)
+
+                ub_it = QTableWidgetItem(unblocks)
+                ub_it.setFont(mono_reg)
+                ub_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                ub_it.setForeground(
+                    QColor(self._palette.emerald) if (is_ok and st == "VERIFIED") else QColor(self._palette.text_secondary)
+                )
+                self.doh_table.setItem(idx, 4, ub_it)
+
+                btn_use = QPushButton(I18N.t("btn_use_doh"))
+                btn_use.setObjectName("EmeraldBtn" if is_ok else "GhostBtn")
+                btn_use.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_use.clicked.connect(lambda _c=False, u=url_str: self._activate_doh_row(u))
+                cell_w = QWidget()
+                cl = QHBoxLayout(cell_w)
+                cl.setContentsMargins(6, 3, 6, 3)
+                cl.addWidget(btn_use)
+                self.doh_table.setCellWidget(idx, 5, cell_w)
+        finally:
+            self.doh_table.setUpdatesEnabled(True)
+
     def _apply_selected_radar_ip(self, apply_all_cdn: bool) -> None:
         sel = self.radar_table.currentRow()
         if sel < 0 and self.radar_table.rowCount() > 0:
@@ -2679,7 +2923,13 @@ class LabPage(QWidget):
     def retranslate_ui(self) -> None:
         self.title_lbl.setText(I18N.t("lab_title"))
         self.sub_lbl.setText(I18N.t("lab_subtitle"))
-        self.mode_seg.update_labels([I18N.t("lab_mode_vectors"), I18N.t("lab_mode_clean_ip")])
+        self.mode_seg.update_labels(
+            [
+                I18N.t("lab_mode_vectors"),
+                I18N.t("lab_mode_clean_ip"),
+                I18N.t("lab_mode_doh"),
+            ]
+        )
         self.scope_lbl.setText(I18N.t("lab_scope_lbl"))
         self.method_lbl.setText(I18N.t("lab_method_lbl"))
         self._populate_scope_combo()
@@ -2690,31 +2940,43 @@ class LabPage(QWidget):
         self.radar_port_lbl.setText(I18N.t("radar_port_lbl"))
         self.btn_apply_sel_ip.setText(I18N.t("btn_apply_sel_cdn"))
         self.btn_apply_all_ip.setText(I18N.t("btn_apply_all_cdn"))
+        self.doh_input_edit.setPlaceholderText(I18N.t("doh_input_ph"))
+        self.btn_add_doh.set_label_text(I18N.t("doh_add_btn"))
+        self.lbl_doh_veil.setText(I18N.t("sw_doh_veil"))
+        self.btn_apply_doh_tunnel.setText(I18N.t("btn_apply_doh_tunnel"))
         self.update_scan_state(self._is_running)
         self._apply_table_headers()
         self._render_lab_table()
+        self._render_doh_table()
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
         self.mode_seg.set_palette_theme(palette)
         self.cfg_card.set_palette_theme(palette)
         self.rad_bar.set_palette_theme(palette)
+        self.doh_bar.set_palette_theme(palette)
         self.sw_winners_only.set_palette_theme(palette)
-        for b in (self.btn_run_lab, self.btn_go_home, self.btn_run_radar):
+        self.sw_doh_veil.set_palette_theme(palette)
+        for b in (self.btn_run_lab, self.btn_go_home, self.btn_run_radar, self.btn_add_doh, self.btn_run_doh):
             b.set_palette_theme(palette)
         self._render_lab_table()
         self._render_radar_table()
+        self._render_doh_table()
 
 
 class RoutingSettingsPage(QWidget):
     settings_changed = Signal(dict)
     setting_key_changed = Signal(str, object)
+    discover_apps_requested = Signal()
+    launch_app_requested = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._palette: ThemePalette = DARK_PALETTE
         self._updating = False
+        self._syncing_app_table = False
         self._domains_as_list = False
+        self._discovered_apps: list[dict] = []
         self._switches: list[AnimatedToggleSwitch] = []
         self._neu_cards: list[NeuCard] = []
         self._switch_labels: list[tuple[QLabel, str, QLabel | None, str | None]] = []
@@ -2739,7 +3001,12 @@ class RoutingSettingsPage(QWidget):
         root.addLayout(t_col)
 
         self.sub_tabs = SegmentedControl(
-            [I18N.t("stab_routing"), I18N.t("stab_behavior"), I18N.t("stab_core")]
+            [
+                I18N.t("stab_routing"),
+                I18N.t("stab_per_app"),
+                I18N.t("stab_behavior"),
+                I18N.t("stab_core"),
+            ]
         )
         self.sub_tabs.current_changed.connect(lambda idx: self.stack.setCurrentIndex(idx))
         root.addWidget(self.sub_tabs)
@@ -2748,6 +3015,7 @@ class RoutingSettingsPage(QWidget):
         root.addWidget(self.stack, 1)
 
         self.stack.addWidget(self._build_routing_tab())
+        self.stack.addWidget(self._build_per_app_tab())
         self.stack.addWidget(self._build_behavior_tab())
         self.stack.addWidget(self._build_core_tab())
 
@@ -2837,6 +3105,240 @@ class RoutingSettingsPage(QWidget):
         vbox.addStretch()
         self._populate_routing_combos()
         return make_transparent_scroll_area(host)
+
+    def _build_per_app_tab(self) -> QWidget:
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 4, 6, 8)
+        vbox.setSpacing(12)
+
+        card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._neu_cards.append(card)
+        cv = QVBoxLayout(card)
+        cv.setContentsMargins(20, 16, 20, 16)
+        cv.setSpacing(10)
+
+        self.lbl_pa_title = QLabel(I18N.t("per_app_launcher_title"))
+        self.lbl_pa_title.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        self.lbl_pa_desc = QLabel(I18N.t("per_app_launcher_desc"))
+        self.lbl_pa_desc.setObjectName("MutedLabel")
+        self.lbl_pa_desc.setWordWrap(True)
+        cv.addWidget(self.lbl_pa_title)
+        cv.addWidget(self.lbl_pa_desc)
+
+        mode_row = QHBoxLayout()
+        mode_row.setSpacing(10)
+        self.lbl_pa_mode = QLabel(I18N.t("per_app_mode_lbl"))
+        self.lbl_pa_mode.setObjectName("SecondaryLabel")
+        self.per_app_mode_combo = QComboBox()
+        self.per_app_mode_combo.currentIndexChanged.connect(self._emit_all)
+
+        self.btn_refresh_apps = ActionPillButton("refresh", I18N.t("btn_refresh_apps"), variant="ghost")
+        self.btn_refresh_apps.clicked.connect(self.discover_apps_requested.emit)
+
+        self.btn_browse_exe = ActionPillButton("plus", I18N.t("btn_browse_exe"), variant="emerald")
+        self.btn_browse_exe.clicked.connect(self._browse_and_add_exe)
+
+        self.btn_launch_sel_app = ActionPillButton("bolt", I18N.t("btn_launch_custom"), variant="gold")
+        self.btn_launch_sel_app.clicked.connect(self._launch_currently_selected_table_app)
+
+        mode_row.addWidget(self.lbl_pa_mode)
+        mode_row.addWidget(self.per_app_mode_combo, 1)
+        mode_row.addWidget(self.btn_refresh_apps)
+        mode_row.addWidget(self.btn_browse_exe)
+        mode_row.addWidget(self.btn_launch_sel_app)
+        cv.addLayout(mode_row)
+
+        self.app_table = QTableWidget(0, 5)
+        self.app_table.setObjectName("VaultTable")
+        self.app_table.setMinimumHeight(230)
+        self.app_table.setAlternatingRowColors(True)
+        self.app_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.app_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.app_table.verticalHeader().setVisible(False)
+        self.app_table.itemChanged.connect(self._on_app_table_check_changed)
+        ah = self.app_table.horizontalHeader()
+        ah.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.app_table.setColumnWidth(0, 54)
+        ah.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        ah.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        ah.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        ah.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        self.app_table.setColumnWidth(4, 152)
+        cv.addWidget(self.app_table, 1)
+
+        self.lbl_pa_manual = QLabel(I18N.t("per_app_manual_lbl"))
+        self.lbl_pa_manual.setObjectName("SecondaryLabel")
+        self.per_app_list_edit = QPlainTextEdit("")
+        self.per_app_list_edit.setObjectName("CodeEditor")
+        self.per_app_list_edit.setPlaceholderText("Claude.exe\nCursor.exe\nChatGPT.exe\nTelegram.exe")
+        self.per_app_list_edit.setMaximumHeight(74)
+        enforce_english_ltr(self.per_app_list_edit, mono_size=9)
+        self.per_app_list_edit.textChanged.connect(self._schedule_domain_emit)
+
+        cv.addWidget(self.lbl_pa_manual)
+        cv.addWidget(self.per_app_list_edit)
+        vbox.addWidget(card, 1)
+
+        self._populate_per_app_combos()
+        self._apply_per_app_headers()
+        return make_transparent_scroll_area(host)
+
+    def _populate_per_app_combos(self) -> None:
+        prev = str(self.per_app_mode_combo.currentData() or "off")
+        with QSignalBlocker(self.per_app_mode_combo):
+            self.per_app_mode_combo.clear()
+            self.per_app_mode_combo.addItem(I18N.t("pamode_off"), "off")
+            self.per_app_mode_combo.addItem(I18N.t("pamode_include"), "include")
+            self.per_app_mode_combo.addItem(I18N.t("pamode_exclude"), "exclude")
+            idx = self.per_app_mode_combo.findData(prev)
+            if idx >= 0:
+                self.per_app_mode_combo.setCurrentIndex(idx)
+
+    def _apply_per_app_headers(self) -> None:
+        self.app_table.setHorizontalHeaderLabels(
+            [
+                I18N.t("per_app_col_sel"),
+                I18N.t("per_app_col_name"),
+                I18N.t("per_app_col_exe"),
+                I18N.t("per_app_col_cat"),
+                I18N.t("per_app_col_launch"),
+            ]
+        )
+
+    def _current_per_app_exe_set(self) -> set[str]:
+        raw = self.per_app_list_edit.toPlainText()
+        out: set[str] = set()
+        for ln in raw.replace(";", "\n").replace(",", "\n").splitlines():
+            tok = os.path.basename(ln.strip()).lower()
+            if tok:
+                out.add(tok)
+        return out
+
+    def set_discovered_apps(self, apps: list) -> None:
+        self._discovered_apps = [dict(a) for a in (apps or []) if isinstance(a, dict)]
+        self._render_app_table()
+
+    def _render_app_table(self) -> None:
+        self._syncing_app_table = True
+        self.app_table.setUpdatesEnabled(False)
+        try:
+            checked_set = self._current_per_app_exe_set()
+            self.app_table.setRowCount(len(self._discovered_apps))
+            mono = make_mono_font(9, bold=True)
+
+            for r_idx, app in enumerate(self._discovered_apps):
+                self.app_table.setRowHeight(r_idx, 42)
+                exe_name = str(app.get("exe") or "").strip()
+                full_path = str(app.get("path") or exe_name).strip()
+                title = strip_emojis(str(app.get("name") or exe_name))
+                cat = str(app.get("category") or "App")
+                st = str(app.get("status") or "INSTALLED")
+
+                chk = QTableWidgetItem()
+                chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable)
+                chk.setCheckState(
+                    Qt.CheckState.Checked if exe_name.lower() in checked_set else Qt.CheckState.Unchecked
+                )
+                chk.setData(Qt.ItemDataRole.UserRole, exe_name)
+                chk.setData(Qt.ItemDataRole.UserRole + 1, full_path)
+                self.app_table.setItem(r_idx, 0, chk)
+
+                nm_it = QTableWidgetItem(title)
+                nm_it.setFont(make_ui_font(10, QFont.Weight.Bold))
+                if "AI" in cat:
+                    nm_it.setForeground(QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309"))
+                self.app_table.setItem(r_idx, 1, nm_it)
+
+                ex_it = QTableWidgetItem(exe_name)
+                ex_it.setFont(mono)
+                ex_it.setForeground(QColor(self._palette.cyan))
+                self.app_table.setItem(r_idx, 2, ex_it)
+
+                cat_it = QTableWidgetItem(f"{cat} ({st})")
+                cat_it.setFont(mono)
+                cat_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                cat_it.setForeground(
+                    QColor(self._palette.emerald) if st == "RUNNING" else QColor(self._palette.text_muted)
+                )
+                self.app_table.setItem(r_idx, 3, cat_it)
+
+                btn_launch = QPushButton(I18N.t("btn_launch_app_row"))
+                btn_launch.setObjectName("EmeraldBtn")
+                btn_launch.setCursor(Qt.CursorShape.PointingHandCursor)
+                btn_launch.clicked.connect(lambda _c=False, p=full_path: self.launch_app_requested.emit(p))
+                cell_w = QWidget()
+                cl = QHBoxLayout(cell_w)
+                cl.setContentsMargins(6, 3, 6, 3)
+                cl.addWidget(btn_launch)
+                self.app_table.setCellWidget(r_idx, 4, cell_w)
+        finally:
+            self.app_table.setUpdatesEnabled(True)
+            self._syncing_app_table = False
+
+    def _on_app_table_check_changed(self, item: QTableWidgetItem) -> None:
+        if self._syncing_app_table or item.column() != 0:
+            return
+        exe_name = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        if not exe_name:
+            return
+        current_lines = [
+            ln.strip()
+            for ln in self.per_app_list_edit.toPlainText().splitlines()
+            if ln.strip()
+        ]
+        low_map = {os.path.basename(x).lower(): x for x in current_lines}
+        if item.checkState() == Qt.CheckState.Checked:
+            low_map[exe_name.lower()] = exe_name
+            if str(self.per_app_mode_combo.currentData() or "off") == "off":
+                idx_inc = self.per_app_mode_combo.findData("include")
+                if idx_inc >= 0:
+                    self.per_app_mode_combo.setCurrentIndex(idx_inc)
+        else:
+            low_map.pop(exe_name.lower(), None)
+
+        self.per_app_list_edit.blockSignals(True)
+        self.per_app_list_edit.setPlainText("\n".join(low_map.values()))
+        self.per_app_list_edit.blockSignals(False)
+        self._emit_all()
+
+    def _browse_and_add_exe(self) -> None:
+        fpath, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Application Executable (.exe)",
+            "",
+            "Windows Executables (*.exe)",
+        )
+        if not fpath:
+            return
+        exe_base = os.path.basename(fpath)
+        cur_lines = [ln.strip() for ln in self.per_app_list_edit.toPlainText().splitlines() if ln.strip()]
+        if exe_base.lower() not in {os.path.basename(x).lower() for x in cur_lines}:
+            cur_lines.append(exe_base)
+            self.per_app_list_edit.setPlainText("\n".join(cur_lines))
+        if not any(str(a.get("exe") or "").lower() == exe_base.lower() for a in self._discovered_apps):
+            self._discovered_apps.insert(0, {
+                "name": os.path.splitext(exe_base)[0].title(),
+                "exe": exe_base,
+                "path": fpath,
+                "status": "CUSTOM",
+                "category": "Custom App",
+            })
+        self._render_app_table()
+        self.launch_app_requested.emit(fpath)
+
+    def _launch_currently_selected_table_app(self) -> None:
+        row = self.app_table.currentRow()
+        if row < 0 and self.app_table.rowCount() > 0:
+            row = 0
+        if row >= 0:
+            it = self.app_table.item(row, 0)
+            if it is not None:
+                full_p = str(it.data(Qt.ItemDataRole.UserRole + 1) or it.data(Qt.ItemDataRole.UserRole) or "")
+                if full_p:
+                    self.launch_app_requested.emit(full_p)
+                    return
+        self._browse_and_add_exe()
 
     def _build_behavior_tab(self) -> QWidget:
         host = QWidget()
@@ -3180,6 +3682,19 @@ class RoutingSettingsPage(QWidget):
                 if idx_rm >= 0:
                     self.routing_mode_combo.setCurrentIndex(idx_rm)
 
+            if "per_app_mode" in s and s["per_app_mode"] is not None:
+                pa_val = str(s["per_app_mode"]).strip().lower()
+                idx_pa = self.per_app_mode_combo.findData(pa_val)
+                if idx_pa >= 0:
+                    self.per_app_mode_combo.setCurrentIndex(idx_pa)
+
+            if "per_app_list" in s and s["per_app_list"] is not None:
+                pa_raw = s["per_app_list"]
+                pa_txt = "\n".join(str(x) for x in pa_raw) if isinstance(pa_raw, list) else str(pa_raw)
+                if pa_txt != self.per_app_list_edit.toPlainText():
+                    self.per_app_list_edit.setPlainText(pa_txt)
+                self._render_app_table()
+
             for combo, key in (
                 (self.sub_hours_combo, "sub_auto_update_hours"),
                 (self.engine_mode_combo, "engine_mode"),
@@ -3243,6 +3758,8 @@ class RoutingSettingsPage(QWidget):
     def collect_settings(self) -> dict:
         return {
             "routing_mode": str(self.routing_mode_combo.currentData() or "bypass_ir"),
+            "per_app_mode": str(self.per_app_mode_combo.currentData() or "off"),
+            "per_app_list": self.per_app_list_edit.toPlainText().strip(),
             "block_quic": bool(self.sw_block_quic.isChecked()),
             "remote_dns": self.remote_dns_edit.text().strip() or "https://1.1.1.1/dns-query",
             "domestic_dns": self.domestic_dns_edit.text().strip() or "178.22.122.100",
@@ -3281,13 +3798,27 @@ class RoutingSettingsPage(QWidget):
     def retranslate_ui(self) -> None:
         self.title_lbl.setText(I18N.t("settings_title"))
         self.sub_lbl.setText(I18N.t("settings_subtitle"))
-        self.sub_tabs.update_labels([I18N.t("stab_routing"), I18N.t("stab_behavior"), I18N.t("stab_core")])
+        self.sub_tabs.update_labels(
+            [
+                I18N.t("stab_routing"),
+                I18N.t("stab_per_app"),
+                I18N.t("stab_behavior"),
+                I18N.t("stab_core"),
+            ]
+        )
         self.lbl_rmode.setText(I18N.t("routing_mode_lbl"))
         self.lbl_remote_dns.setText(I18N.t("remote_dns_lbl"))
         self.lbl_dom_dns.setText(I18N.t("domestic_dns_lbl"))
         self.lbl_direct_dom.setText(I18N.t("direct_domains_lbl"))
         self.lbl_proxy_dom.setText(I18N.t("proxy_domains_lbl"))
         self.lbl_block_dom.setText(I18N.t("blocked_domains_lbl"))
+        self.lbl_pa_title.setText(I18N.t("per_app_launcher_title"))
+        self.lbl_pa_desc.setText(I18N.t("per_app_launcher_desc"))
+        self.lbl_pa_mode.setText(I18N.t("per_app_mode_lbl"))
+        self.btn_refresh_apps.set_label_text(I18N.t("btn_refresh_apps"))
+        self.btn_browse_exe.set_label_text(I18N.t("btn_browse_exe"))
+        self.btn_launch_sel_app.set_label_text(I18N.t("btn_launch_custom"))
+        self.lbl_pa_manual.setText(I18N.t("per_app_manual_lbl"))
         self.lbl_sub_hrs.setText(I18N.t("sub_autoupdate_lbl"))
         self.lbl_sw_frag.setText(I18N.t("sw_native_frag"))
         self.lbl_sw_mux.setText(I18N.t("sw_mux"))
@@ -3298,6 +3829,9 @@ class RoutingSettingsPage(QWidget):
         for lbl, k_str in self._core_field_labels:
             lbl.setText(I18N.t(k_str))
         self._populate_routing_combos()
+        self._populate_per_app_combos()
+        self._apply_per_app_headers()
+        self._render_app_table()
         self._populate_behavior_combos()
         self._populate_core_combos()
 
@@ -3308,6 +3842,9 @@ class RoutingSettingsPage(QWidget):
             card.set_palette_theme(palette)
         for sw in self._switches:
             sw.set_palette_theme(palette)
+        for b in (self.btn_refresh_apps, self.btn_browse_exe, self.btn_launch_sel_app):
+            b.set_palette_theme(palette)
+        self._render_app_table()
 
 
 class LogsPage(QWidget):
