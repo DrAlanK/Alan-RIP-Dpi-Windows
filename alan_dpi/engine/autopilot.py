@@ -16,7 +16,9 @@ import requests
 from alan_dpi.engine.bridge import FullDuplexMutatorBridge
 from alan_dpi.engine.clean_ip import CleanIpScanner, SEED_CLEAN_IPS
 from alan_dpi.engine.doh_shield import DohVeilEngine
+from alan_dpi.engine.updater import GithubUpdateChecker
 from alan_dpi.engine.models import (
+    APP_VERSION,
     BypassVector,
     EngineSettings,
     EngineState,
@@ -44,14 +46,19 @@ HIDDEN_AUTO_SUB_URLS: List[str] = [
 ]
 
 FAST_LAB_VECTOR_IDS = [
+    "VEC-27",
+    "VEC-28",
+    "VEC-24",
+    "VEC-25",
+    "VEC-26",
+    "VEC-19",
+    "VEC-20",
     "VEC-21",
     "VEC-22",
     "VEC-23",
     "VEC-01",
     "VEC-18",
     "VEC-17",
-    "VEC-19",
-    "VEC-20",
     "VEC-04",
     "VEC-00",
 ]
@@ -173,6 +180,7 @@ class AlanAutoPilotEngine:
         self._on_profiles_changed = on_profiles_changed
         self.on_verified_outputs = on_verified_outputs
         self.on_auto_locations: Optional[Callable[[List[dict], str], None]] = None
+        self.on_update_checked: Optional[Callable[[dict], None]] = None
         self.on_settings = on_settings_changed
         self.on_subscriptions = on_subscriptions_changed
         self.on_scan_row = on_scan_row
@@ -577,7 +585,7 @@ class AlanAutoPilotEngine:
         uri_low = node.uri.lower()
         proto_up = node.protocol.upper()
 
-        if proto_up in ("SHADOWSOCKS", "SOCKS"):
+        if proto_up in ("SHADOWSOCKS", "SOCKS", "SOCKS5", "SOCKS4"):
             return [direct_vec]
 
         if "security=reality" in uri_low:
@@ -767,7 +775,16 @@ class AlanAutoPilotEngine:
                 with open(self.repo_path, "r", encoding="utf-8") as f:
                     raw = json.load(f)
                     if isinstance(raw, list):
-                        return [ProfileNode.from_dict(item) for item in raw if not item.get("is_hidden_pool")]
+                        removed_protos = {"ANYCONNECT", "OPENCONNECT", "L2TP", "IKEV2", "IPSEC", "WIREGUARD", "AMNEZIAWG"}
+                        nodes: List[ProfileNode] = []
+                        for item in raw:
+                            if (not isinstance(item, dict)) or item.get("is_hidden_pool"):
+                                continue
+                            nd = ProfileNode.from_dict(item)
+                            if nd.protocol.upper() in removed_protos:
+                                continue
+                            nodes.append(nd)
+                        return nodes
             except Exception:
                 pass
         if DEFAULT_BOOTSTRAP_URI.strip():
@@ -775,6 +792,8 @@ class AlanAutoPilotEngine:
             self._save_profiles([seed])
             return [seed]
         return []
+
+
 
     def _save_profiles(self, nodes: Optional[List[ProfileNode]] = None):
         target_nodes = nodes if (nodes is not None) else self.profiles
@@ -1079,6 +1098,8 @@ class AlanAutoPilotEngine:
         self._sync_per_app_gateway()
         if self.snapshot.is_connected:
             WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
+            if self.settings.per_app_winhttp_sync:
+                PerAppSplitGateway.sync_winhttp_proxy(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
         self._notify_settings_updated()
         self._push_telemetry()
 
@@ -1178,6 +1199,7 @@ class AlanAutoPilotEngine:
             def _disable_tun():
                 self.tun.stop()
                 self.bridge.refresh_physical_interface(enable_tun_bind=False)
+                self.per_app_gateway.set_physical_bind_ip("")
                 if self.snapshot.is_connected and (self._active_runtime_node is not None):
                     self.xray.ensure_running(
                         uri=self._active_runtime_node.uri,
@@ -1187,6 +1209,8 @@ class AlanAutoPilotEngine:
                     self._sync_per_app_gateway()
                     if self.settings.system_proxy_enabled:
                         WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
+                        if self.settings.per_app_winhttp_sync:
+                            PerAppSplitGateway.sync_winhttp_proxy(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
                 self.snapshot.tun_badge = "OFF"
                 self._emit_tun_status(False, False, "OFF")
 
@@ -1195,6 +1219,7 @@ class AlanAutoPilotEngine:
     def _activate_xray_tun_async(self, node: ProfileNode, endpoint_host: str):
         _, phys_alias = self.tun.detect_physical_egress()
         self.bridge.refresh_physical_interface(enable_tun_bind=True)
+        self.per_app_gateway.set_physical_bind_ip(self.bridge._physical_bind_ip)
         self.tun.ensure_wintun_dll()
         self.xray._native_tun_supported = None
         native_tun = self.xray.supports_native_tun() and self.tun.has_wintun_dll()
@@ -1217,6 +1242,7 @@ class AlanAutoPilotEngine:
         if not ok:
             self.emit_log(f"[TUN] Activation aborted: {detail}")
             self.bridge.refresh_physical_interface(enable_tun_bind=False)
+            self.per_app_gateway.set_physical_bind_ip("")
             self.settings.tun_enabled = False
             self.snapshot.tun_badge = "OFF"
             self._save_settings(self.settings)
@@ -1301,7 +1327,7 @@ class AlanAutoPilotEngine:
             "routing_mode", "block_quic", "remote_dns", "domestic_dns",
             "custom_direct_domains", "custom_proxy_domains", "custom_blocked_domains",
             "fingerprint", "alpn_override", "mux_enabled", "mux_concurrency",
-            "per_app_mode", "per_app_list",
+            "per_app_mode", "per_app_list", "per_app_winhttp_sync",
         }
         needs_xray_reload = any(k in normalized for k in hot_reload_keys)
 
@@ -1317,6 +1343,8 @@ class AlanAutoPilotEngine:
                     self.emit_log(f"[Xray] Hot-reload warning: {exc}")
             if self.settings.system_proxy_enabled != prev_sys_proxy or needs_xray_reload:
                 WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
+                if self.settings.per_app_winhttp_sync:
+                    PerAppSplitGateway.sync_winhttp_proxy(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
 
         self._notify_settings_updated()
         self._push_telemetry()
@@ -1391,10 +1419,35 @@ class AlanAutoPilotEngine:
         self.emit_log(f"[Repository] Cleared all {visible_count} profile(s) from repository.")
         return visible_count
 
-    def import_configs(self, raw_text: str, group_tag: str = "Manual") -> int:
-        uris = UriConfigCodec.extract_uris_from_blob(raw_text)
+    @staticmethod
+    def _extract_sub_urls_from_text(raw_text: str) -> List[str]:
+        urls: List[str] = []
+        for raw_ln in str(raw_text or "").splitlines():
+            ln = raw_ln.strip()
+            if ln.lower().startswith(("http://", "https://")) and (" " not in ln):
+                if ln not in urls:
+                    urls.append(ln)
+        return urls
+
+    def import_configs(self, raw_text: str, group_tag: str = "Manual", default_name: str = "") -> int:
+        uris = UriConfigCodec.extract_uris_from_blob(raw_text, default_name=default_name)
+
+        # Smart Clipboard Detection: auto-detect subscription URL(s) vs raw/base64 configs
         if not uris:
+            sub_urls = self._extract_sub_urls_from_text(raw_text)
+            if sub_urls:
+                added_subs = 0
+                for idx_s, s_url in enumerate(sub_urls, 1):
+                    parsed_u = urllib.parse.urlsplit(s_url)
+                    frag_title = urllib.parse.unquote(parsed_u.fragment or "").strip()
+                    host_stem = (parsed_u.hostname or f"Sub-{idx_s}").split(".")[0]
+                    auto_title = frag_title or (default_name.strip() if default_name else f"Sub-{host_stem}")
+                    self.emit_log(f"[SmartClipboard] Detected Subscription URL -> adding & fetching '{auto_title}'...")
+                    self.add_subscription(s_url, title=auto_title)
+                    added_subs += 1
+                return added_subs
             return 0
+
         added = 0
         with self._repo_lock:
             existing_uris = {p.uri for p in self.profiles if not p.is_hidden_pool}
@@ -1415,16 +1468,26 @@ class AlanAutoPilotEngine:
             self.emit_log(f"[Repository] Added {added} profile(s) under group '{group_tag}'.")
         return added
 
-    def import_configs_from_file(self, file_path: str) -> int:
+
+    def import_configs_from_file(self, file_path: str, group_tag: str = "") -> int:
         if (not file_path) or (not os.path.exists(file_path)):
             return 0
         try:
-            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            with open(file_path, "r", encoding="utf-8-sig", errors="ignore") as f:
                 content = f.read()
-            return self.import_configs(content, group_tag=os.path.basename(file_path))
+            base_name = os.path.basename(file_path)
+            stem_name = os.path.splitext(base_name)[0]
+            grp = (group_tag or "").strip() or "Manual"
+            return self.import_configs(content, group_tag=grp, default_name=stem_name)
         except Exception as exc:
             self.emit_log(f"[Import] File read error: {exc}")
             return 0
+
+    def import_configs_from_files(self, file_paths: List[str], group_tag: str = "") -> int:
+        total = 0
+        for fp in file_paths or []:
+            total += self.import_configs_from_file(str(fp), group_tag=group_tag)
+        return total
 
     def add_subscription(self, url: str, title: str = "Subscription") -> int:
         clean_url = (url or "").strip()
@@ -1461,7 +1524,12 @@ class AlanAutoPilotEngine:
             if (resp.status_code == 200) and bool(resp.text):
                 uris = UriConfigCodec.extract_uris_from_blob(resp.text)
                 if uris:
-                    new_nodes = [UriConfigCodec.extract_profile_node(u, group_tag=sub.title) for u in uris]
+                    new_nodes = []
+                    for u in uris:
+                        try:
+                            new_nodes.append(UriConfigCodec.extract_profile_node(u, group_tag=sub.title))
+                        except Exception as ex_u:
+                            self.emit_log(f"[Subscription] Skipped malformed entry in '{sub.title}': {ex_u}")
                     with self._repo_lock:
                         self.profiles = [p for p in self.profiles if p.is_hidden_pool or (p.group_tag != sub.title)]
                         self.profiles.extend(new_nodes)
@@ -1480,6 +1548,23 @@ class AlanAutoPilotEngine:
 
     def refresh_subscriptions(self):
         self.refresh_all_subscriptions()
+
+    def refresh_single_subscription(self, title_or_url: str) -> bool:
+        key = str(title_or_url or "").strip()
+        if not key or key.lower() in ("all", "همه", "manual"):
+            self.refresh_all_subscriptions()
+            return True
+        with self._repo_lock:
+            target = next(
+                (s for s in self.subscriptions if s.title.lower() == key.lower() or s.url == key),
+                None,
+            )
+        if target is None:
+            self.emit_log(f"[Subscription] No subscription feed found for tab '{key}'.")
+            return False
+        self.emit_log(f"[Subscription] Updating single subscription '{target.title}'...")
+        threading.Thread(target=self._pull_single_subscription, args=(target,), daemon=True).start()
+        return True
 
     def refresh_all_subscriptions(self):
         def _bg():
@@ -1648,6 +1733,7 @@ class AlanAutoPilotEngine:
                 matched.append(nd)
         return matched
 
+
     def ping_configs(self, uid_list: Optional[Any] = None, check_gemini: bool = False):
         def _real_ping_worker():
             targets = self._normalize_target_nodes(uid_list)
@@ -1713,6 +1799,8 @@ class AlanAutoPilotEngine:
             self._emit_task_progress(False, 100, summary)
 
         threading.Thread(target=_real_ping_worker, daemon=True).start()
+
+
 
     def quick_ping_repository(self):
         self.ping_configs(uid_list=None, check_gemini=False)
@@ -2233,7 +2321,7 @@ class AlanAutoPilotEngine:
                     continue
 
                 node_plan = self._build_vector_plan(cand_node, self.settings.engine_mode)
-                probe_vecs = node_plan[:3] if CleanIpScanner.is_domestic_or_direct_tunnel(cand_node) else node_plan[:5]
+                probe_vecs = node_plan[:3] if CleanIpScanner.is_domestic_or_direct_tunnel(cand_node) else node_plan[:7]
 
                 endpoints_for_cand = [cand_ep]
                 cand_connected = False
@@ -2284,7 +2372,7 @@ class AlanAutoPilotEngine:
 
                         f_ok, f_ms, f_up, _ = self._probe_full_tuple(
                             http_port=self.xray.active_http_port,
-                            verify_upload=self.settings.verify_upload_stream,
+                            verify_upload=True,
                             require_youtube_6s=self.settings.require_youtube_6s,
                             abort_check=lambda: self._is_op_cancelled(gen_id),
                         )
@@ -2303,7 +2391,7 @@ class AlanAutoPilotEngine:
 
             final_pool = qualified_winners if qualified_winners else soft_winners
             if final_pool:
-                final_pool.sort(key=lambda x: x[0])
+                final_pool.sort(key=lambda x: (x[0] - int(min(150.0, x[1] * 0.30))))
                 win_ms, win_up, win_node, win_ep, win_vec = final_pool[0]
 
                 self.xray.ensure_running(uri=win_node.uri, settings=self.settings, use_native_fragment=False)
@@ -2355,6 +2443,7 @@ class AlanAutoPilotEngine:
         target_vector: str = "ALL",
         check_gemini: bool = False,
         auto_connect: bool = False,
+        use_clean_ip: bool = False,
     ):
         with self._state_lock:
             self._op_generation += 1
@@ -2387,7 +2476,7 @@ class AlanAutoPilotEngine:
             idx = visible.index(targets[0])
             self._worker_thread = threading.Thread(
                 target=self._run_active_profile_matrix_scan,
-                args=(gen_id, idx, auto_connect, check_gemini, None),
+                args=(gen_id, idx, auto_connect, check_gemini, None, bool(use_clean_ip)),
                 daemon=True,
             )
             self._worker_thread.start()
@@ -2397,7 +2486,7 @@ class AlanAutoPilotEngine:
             idx = visible.index(targets[0])
             self._worker_thread = threading.Thread(
                 target=self._run_active_profile_matrix_scan,
-                args=(gen_id, idx, auto_connect, check_gemini, chosen_vec),
+                args=(gen_id, idx, auto_connect, check_gemini, chosen_vec, bool(use_clean_ip)),
                 daemon=True,
             )
             self._worker_thread.start()
@@ -2406,7 +2495,7 @@ class AlanAutoPilotEngine:
         effective_mode = chosen_vec if chosen_vec.startswith("VEC-") else depth_token.lower()
         self._worker_thread = threading.Thread(
             target=self._run_lab_batch_scan_task,
-            args=(gen_id, targets, effective_mode, check_gemini, auto_connect),
+            args=(gen_id, targets, effective_mode, check_gemini, auto_connect, bool(use_clean_ip)),
             daemon=True,
         )
         self._worker_thread.start()
@@ -2521,6 +2610,7 @@ class AlanAutoPilotEngine:
         scan_depth: str,
         check_gemini: bool,
         auto_connect: bool,
+        use_clean_ip: bool = False,
     ):
         if not targets:
             self._emit_scan_state(False, "کانفیگی برای آزمایشگاه انتخاب نشده است")
@@ -2570,7 +2660,7 @@ class AlanAutoPilotEngine:
                     step_done += len(vec_pool)
                     continue
 
-                node_vecs = [find_vector("VEC-00")] if (nd.protocol.upper() in ("SHADOWSOCKS", "SOCKS")) else vec_pool
+                node_vecs = [find_vector("VEC-00")] if (nd.protocol.upper() in ("SHADOWSOCKS", "SOCKS", "SOCKS5", "SOCKS4")) else vec_pool
                 best_for_node: Optional[Tuple[int, float, BypassVector, str, str]] = None
 
                 stage_endpoints: List[str] = []
@@ -2586,7 +2676,7 @@ class AlanAutoPilotEngine:
                         ep_host = stage_endpoints[0]
                         ep_vecs = node_vecs
                     else:
-                        if (best_for_node is not None) or (not self.settings.auto_clean_ip) or (not CleanIpScanner.is_cdn_eligible(nd)):
+                        if (best_for_node is not None) or (not use_clean_ip) or (not CleanIpScanner.is_cdn_eligible(nd)):
                             break
                         self.emit_log(f"[Lab] Direct host blocked on '{nd.name}' -> Trying Clean IP fallback...")
                         fb_ips = self._discover_fallback_clean_ips(nd, gen_id, port_edge_cache=port_edge_cache, sample_count=30)
@@ -2635,7 +2725,7 @@ class AlanAutoPilotEngine:
                             g_ok, _ = TunnelStreamVerifier.check_gemini_access(lab_http, timeout=5.0)
                             gem_label = "OK" if g_ok else "BLOCKED"
 
-                        score = max(15, min(100, int(100 - (q_ms / 24.0) + min(20.0, up_kbps / 15.0))))
+                        score = max(15, min(100, int(100 - (q_ms / 26.0) + min(28.0, up_kbps / 11.0))))
                         row = {
                             "scan_type": "lab",
                             "rank": 1,
@@ -2711,6 +2801,7 @@ class AlanAutoPilotEngine:
         auto_connect: bool,
         check_gemini: bool = False,
         single_vector_id: Optional[str] = None,
+        use_clean_ip: bool = False,
     ):
         visible = self.get_visible_profiles()
         if not (0 <= idx < len(visible)):
@@ -2741,7 +2832,7 @@ class AlanAutoPilotEngine:
 
             orig_ep = self._resolve_origin_endpoint(node)
             orig_tcp_ms = CleanIpScanner.fast_tcp_ping(orig_ep, node.port, timeout=1.7) if orig_ep else -1
-            can_fallback_cdn = bool(self.settings.auto_clean_ip) and CleanIpScanner.is_cdn_eligible(node)
+            can_fallback_cdn = bool(use_clean_ip) and CleanIpScanner.is_cdn_eligible(node)
 
             if orig_tcp_ms >= 0:
                 active_endpoint = orig_ep
@@ -2811,7 +2902,7 @@ class AlanAutoPilotEngine:
 
                     f_ok, f_ms, f_up, f_detail = self._probe_full_tuple(
                         http_port=lab_http,
-                        verify_upload=self.settings.verify_upload_stream,
+                        verify_upload=True,
                         require_youtube_6s=self.settings.require_youtube_6s,
                         abort_check=lambda: self._is_op_cancelled(gen_id),
                     )
@@ -2828,7 +2919,7 @@ class AlanAutoPilotEngine:
                         else:
                             gem_stat = "OK" if (node.gemini_status == "OK") else ""
 
-                        score = max(35, min(100, int(100 - (f_ms // 22) + min(15.0, f_up / 20.0))))
+                        score = max(35, min(100, int(100 - (f_ms // 24) + min(26.0, f_up / 12.0))))
                         row = {
                             "scan_type": "vector",
                             "rank": 1,
@@ -2973,7 +3064,9 @@ class AlanAutoPilotEngine:
             self._abort_flag = True
         self.tun.stop()
         self.bridge.refresh_physical_interface(enable_tun_bind=False)
+        self.per_app_gateway.set_physical_bind_ip("")
         WindowsSystemProxy.apply(False, self.xray.active_http_port)
+        PerAppSplitGateway.sync_winhttp_proxy(False, 0)
         self.bridge.drop_active_connections()
         self.xray.stop()
 
@@ -3130,7 +3223,9 @@ class AlanAutoPilotEngine:
         def _async_teardown():
             self.tun.stop()
             self.bridge.refresh_physical_interface(enable_tun_bind=False)
+            self.per_app_gateway.set_physical_bind_ip("")
             WindowsSystemProxy.apply(False, self.xray.active_http_port)
+            PerAppSplitGateway.sync_winhttp_proxy(False, 0)
             self.bridge.drop_active_connections()
             self.xray.stop()
             self._emit_tun_status(self.settings.tun_enabled, False, "Disconnected")
@@ -3149,8 +3244,27 @@ class AlanAutoPilotEngine:
         self.per_app_gateway.stop()
         self.doh_engine.stop_system_doh_veil()
         WindowsSystemProxy.apply(False, self.xray.active_http_port)
+        PerAppSplitGateway.sync_winhttp_proxy(False, 0)
         self.bridge.stop()
         self.xray.stop()
+
+    def check_for_updates(self):
+        def _upd_worker():
+            px_port = self.xray.active_http_port if self.snapshot.is_connected else 0
+            res = GithubUpdateChecker.check_latest_release(current_version=APP_VERSION, proxy_http_port=px_port)
+            if self.on_update_checked is not None:
+                self.on_update_checked(res)
+            if res.get("ok"):
+                if res.get("has_update"):
+                    self.emit_log(f"[Updater] New version available: v{res['latest_version']} (current: v{APP_VERSION})")
+                else:
+                    self.emit_log(f"[Updater] Alan-RIP-Dpi v{APP_VERSION} is up to date.")
+            else:
+                self.emit_log(f"[Updater] Check failed: {res.get('error')}")
+        threading.Thread(target=_upd_worker, daemon=True).start()
+
+
+
 
     def _execute_autopilot_pipeline(self, gen_id: int, node: ProfileNode, max_vectors: int = 12, force_auto_vectors: bool = True) -> bool:
         try:
@@ -3158,6 +3272,7 @@ class AlanAutoPilotEngine:
                 node.cached_clean_ip = ""
 
             self.bridge.refresh_physical_interface(enable_tun_bind=False)
+            self.per_app_gateway.set_physical_bind_ip("")
             self.bridge.reset_counters()
             self._prev_tx_bytes = 0
             self._prev_rx_bytes = 0
@@ -3258,7 +3373,7 @@ class AlanAutoPilotEngine:
                     )
                     f_ok, f_ms, f_up, _ = self._probe_full_tuple(
                         http_port=self.xray.active_http_port,
-                        verify_upload=self.settings.verify_upload_stream,
+                        verify_upload=True,
                         require_youtube_6s=self.settings.require_youtube_6s,
                         abort_check=lambda: self._is_op_cancelled(gen_id),
                     )
@@ -3370,6 +3485,8 @@ class AlanAutoPilotEngine:
         self._sync_per_app_gateway()
         if self.settings.system_proxy_enabled:
             WindowsSystemProxy.apply(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
+            if self.settings.per_app_winhttp_sync:
+                PerAppSplitGateway.sync_winhttp_proxy(self._should_enable_global_wininet_proxy(), self._effective_system_proxy_port())
 
         shown_ep = f"Protected Edge ({node.country_code or 'GLOBAL'})" if node.is_hidden_pool else f"{endpoint_ip}:{node.port}"
         shown_name = f"Alan Smart Auto ({node.country_code or 'GLOBAL'})" if node.is_hidden_pool else node.name
@@ -3491,7 +3608,10 @@ class AlanAutoPilotEngine:
                 self.snapshot.auto_mode_enabled = self.is_auto_repo_mode()
                 self.snapshot.preferred_auto_location = self.get_selected_auto_location()
                 self.snapshot.doh_shield_active = self.doh_engine.veil_active
+                pa_st = self.per_app_gateway.get_stats()
                 self.snapshot.per_app_mode = self.settings.per_app_mode
+                self.snapshot.per_app_tunneled = pa_st.get('tunneled', 0)
+                self.snapshot.per_app_bypassed = pa_st.get('bypassed', 0)
                 self.snapshot.system_proxy_enabled = self.settings.system_proxy_enabled
                 self.snapshot.selected_index = max(0, self.selected_index)
 

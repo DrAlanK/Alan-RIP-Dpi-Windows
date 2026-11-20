@@ -328,60 +328,175 @@ class TunnelStreamVerifier:
         finally:
             sess.close()
 
+
+    @classmethod
+    def measure_sustained_download_kbps(
+        cls,
+        http_port: int,
+        target_bytes: int = 163840,
+        timeout: float = 7.5,
+        abort_check=None,
+    ) -> Tuple[bool, float, str]:
+        """
+        Catches regional PMTU blackholes & 16KB-32KB flow-stalls where tiny pings pass
+        but real web pages freeze after initial handshake.
+        """
+        px = f"http://127.0.0.1:{int(http_port)}"
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": px, "https": px}
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+        endpoints = [
+            (f"https://speed.cloudflare.com/__down?bytes={int(target_bytes)}", 65536),
+            ("https://www.gstatic.com/webp/gallery/4.webp", 45000),
+            ("https://raw.githubusercontent.com/XTLS/Xray-core/main/README.md", 8000),
+        ]
+
+        try:
+            for url, min_ok_bytes in endpoints:
+                if (abort_check is not None) and abort_check():
+                    return False, 0.0, "Aborted"
+                try:
+                    t0 = time.perf_counter()
+                    received = 0
+                    with sess.get(url, stream=True, timeout=(4.0, timeout), allow_redirects=True) as resp:
+                        if resp.status_code != 200:
+                            continue
+                        for chunk in resp.iter_content(chunk_size=16384):
+                            if (abort_check is not None) and abort_check():
+                                return False, 0.0, "Aborted"
+                            if chunk:
+                                received += len(chunk)
+                                if received >= target_bytes:
+                                    break
+                    dt = max(0.05, time.perf_counter() - t0)
+                    if received >= min_ok_bytes:
+                        kbps = round((received / 1024.0) / dt, 1)
+                        lbl = f"{kbps / 1024.0:.2f} MB/s" if kbps >= 1024.0 else f"{kbps:.0f} KB/s"
+                        return True, kbps, f"DL {lbl}"
+                except Exception:
+                    continue
+            return False, 0.0, "Download Stalled (PMTU/16KB Drop)"
+        finally:
+            sess.close()
+
+    @classmethod
+    def measure_accurate_upload_kbps(
+        cls,
+        http_port: int,
+        payload_kb: int = 192,
+        timeout: float = 8.5,
+        abort_check=None,
+    ) -> Tuple[bool, float, str]:
+        px = f"http://127.0.0.1:{int(http_port)}"
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": px, "https": px}
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+        size_bytes = max(32, int(payload_kb)) * 1024
+        blob = os.urandom(size_bytes)
+
+        endpoints = [
+            ("https://speed.cloudflare.com/__up", blob),
+            ("https://postman-echo.com/post", blob[:65536]),
+            ("https://httpbin.org/post", blob[:65536]),
+        ]
+
+        try:
+            for url, data_chunk in endpoints:
+                if (abort_check is not None) and abort_check():
+                    return False, 0.0, "Aborted"
+                try:
+                    t0 = time.perf_counter()
+                    resp = sess.post(
+                        url,
+                        data=data_chunk,
+                        headers={
+                            "Content-Type": "application/octet-stream",
+                            "Cache-Control": "no-cache",
+                        },
+                        timeout=timeout,
+                        allow_redirects=False,
+                    )
+                    dt = max(0.05, time.perf_counter() - t0)
+                    if resp.status_code in (200, 201, 204):
+                        kbps = round((len(data_chunk) / 1024.0) / dt, 1)
+                        if kbps >= 3.0:
+                            lbl = f"{kbps / 1024.0:.2f} MB/s" if kbps >= 1024.0 else f"{kbps:.0f} KB/s"
+                            return True, kbps, f"Real Upload {lbl}"
+                except Exception:
+                    continue
+            return False, 0.0, "Upload Stalled / Timeout"
+        finally:
+            sess.close()
+
     @classmethod
     def run_full_qualification(
         cls,
         http_port: int,
         verify_upload: bool = True,
         require_youtube_6s: bool = True,
-        abort_check: Optional[Callable[[], bool]] = None,
+        abort_check=None,
     ) -> Tuple[bool, int, float, str]:
-        sess = cls._make_proxy_session(http_port)
+        ok_fast, base_ping, fast_detail = cls.fast_probe(http_port=http_port, timeout=4.2)
+        if not ok_fast:
+            return False, -1, 0.0, fast_detail
+
+        dl_ok, dl_kbps, dl_det = cls.measure_sustained_download_kbps(
+            http_port=http_port,
+            target_bytes=163840,
+            timeout=7.5,
+            abort_check=abort_check,
+        )
+        if not dl_ok:
+            return False, base_ping, 0.0, dl_det
+
+        upload_kbps = 0.0
+        if verify_upload:
+            up_ok, upload_kbps, up_det = cls.measure_accurate_upload_kbps(
+                http_port=http_port,
+                payload_kb=192,
+                timeout=8.5,
+                abort_check=abort_check,
+            )
+            if not up_ok:
+                return False, base_ping, 0.0, up_det
+
+        px = f"http://127.0.0.1:{int(http_port)}"
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": px, "https": px}
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
         try:
-            t0 = time.perf_counter()
-            r0 = sess.get("https://www.youtube.com/generate_204", timeout=4.5, allow_redirects=False)
-            if r0.status_code not in (200, 204):
-                r0 = sess.get("https://www.gstatic.com/generate_204", timeout=4.2, allow_redirects=False)
-                if r0.status_code not in (200, 204):
-                    return False, -1, 0.0, f"Initial HTTP {r0.status_code}"
-            base_ping = max(1, int((time.perf_counter() - t0) * 1000))
-
-            upload_kbps = 0.0
-            if verify_upload:
-                if (abort_check is not None) and abort_check():
-                    return False, base_ping, 0.0, "Aborted"
-                post_blob = os.urandom(16384)
-                t_up = time.perf_counter()
-                ru = sess.post(
-                    "https://www.gstatic.com/generate_204",
-                    data=post_blob,
-                    headers={"Content-Type": "application/octet-stream"},
-                    timeout=5.5,
-                    allow_redirects=False,
-                )
-                if ru.status_code not in (200, 204, 405):
-                    return False, base_ping, 0.0, f"Upload HTTP {ru.status_code}"
-                dt_up = max(0.03, time.perf_counter() - t_up)
-                upload_kbps = round((len(post_blob) / 1024.0) / dt_up, 1)
-
             if require_youtube_6s:
-                start_hold = time.perf_counter()
-                for checkpoint in (2.3, 5.0):
-                    while (time.perf_counter() - start_hold) < checkpoint:
-                        if (abort_check is not None) and abort_check():
-                            return False, base_ping, upload_kbps, "Aborted"
-                        time.sleep(0.15)
-                    t_p = time.perf_counter()
-                    ry = sess.get("https://www.youtube.com/generate_204", timeout=4.2, allow_redirects=False)
+                for step_i in range(2):
+                    if (abort_check is not None) and abort_check():
+                        return False, base_ping, upload_kbps, "Aborted"
+                    time.sleep(0.55)
+                    ry = sess.get(
+                        f"https://www.youtube.com/generate_204?t={step_i}",
+                        timeout=4.2,
+                        allow_redirects=False,
+                    )
                     if ry.status_code not in (200, 204):
-                        return False, base_ping, upload_kbps, "Dropped on 6s hold"
-                    base_ping = (base_ping + max(1, int((time.perf_counter() - t_p) * 1000))) // 2
+                        return False, base_ping, upload_kbps, f"YouTube stream drop ({ry.status_code})"
 
-            return True, base_ping, upload_kbps, "VERIFIED"
+            t_end = time.perf_counter()
+            r_final = sess.get("https://www.gstatic.com/generate_204", timeout=3.8, allow_redirects=False)
+            if r_final.status_code not in (200, 204):
+                return False, base_ping, upload_kbps, f"Final check HTTP {r_final.status_code}"
+            final_ping = max(1, int((time.perf_counter() - t_end) * 1000))
+            avg_ping = (base_ping + final_ping) // 2
+            up_str = f"{upload_kbps / 1024.0:.2f} MB/s" if upload_kbps >= 1024.0 else f"{upload_kbps:.0f} KB/s"
+            return True, avg_ping, upload_kbps, f"{dl_det} | UL {up_str}"
         except Exception as exc:
-            return False, -1, 0.0, str(exc)[:36]
+            return False, base_ping, upload_kbps, f"Stream interrupted: {str(exc)[:36]}"
         finally:
             sess.close()
+
 
     @classmethod
     def resolve_egress_ip(cls, http_port: int, timeout: float = 4.0) -> str:

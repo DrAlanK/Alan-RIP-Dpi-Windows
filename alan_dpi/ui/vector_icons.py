@@ -372,6 +372,13 @@ class VectorIconPainter:
             cut.addEllipse(QPointF(cx + r * 0.38, cy - r * 0.28), r * 0.75, r * 0.75)
             painter.drawPath(path.subtracted(cut))
 
+        elif name == "info":
+            painter.drawEllipse(QPointF(cx, cy), r * 0.92, r * 0.92)
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(cx, cy - r * 0.36), 1.35, 1.35)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawLine(QPointF(cx, cy - r * 0.06), QPointF(cx, cy + r * 0.48))
+
         elif name == "close":
             painter.drawLine(QPointF(cx - r * 0.65, cy - r * 0.65), QPointF(cx + r * 0.65, cy + r * 0.65))
             painter.drawLine(QPointF(cx + r * 0.65, cy - r * 0.65), QPointF(cx - r * 0.65, cy + r * 0.65))

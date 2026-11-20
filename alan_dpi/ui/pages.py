@@ -1,8 +1,9 @@
 import os
 from pathlib import Path
-from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QRectF, QSignalBlocker, QSize, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import (
     QColor,
+    QDesktopServices,
     QFont,
     QFontMetrics,
     QGuiApplication,
@@ -13,7 +14,9 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
+    QAbstractButton,
     QCheckBox,
+    QSizePolicy,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -36,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from .animated_widgets import (
     ActionPillButton,
+    JustifiedFlowLayout,
     AnimatedRadarCore,
     AnimatedToggleSwitch,
     KineticConnectButton,
@@ -651,6 +655,7 @@ class ConfigEditorDialog(BaseThemedDialog):
             ("vmess", "VMess"),
             ("trojan", "Trojan"),
             ("ss", "Shadowsocks"),
+            ("socks", "SOCKS5"),
             ("tuic", "TUIC"),
             ("hysteria2", "Hysteria2"),
         ):
@@ -787,6 +792,8 @@ class ConfigEditorDialog(BaseThemedDialog):
         proto = str(self._initial.get("protocol") or "vless").lower()
         if proto == "shadowsocks":
             proto = "ss"
+        elif proto in ("socks5", "socks4"):
+            proto = "socks"
         idx = self.proto_combo.findData(proto)
         if idx >= 0:
             self.proto_combo.setCurrentIndex(idx)
@@ -1610,6 +1617,9 @@ class HomePage(QWidget):
 class ConfigsPage(QWidget):
     select_active_requested = Signal(object)
     import_clipboard_requested = Signal(str, str)
+    import_files_requested = Signal(list, str)
+    refresh_single_sub_requested = Signal(str)
+    refresh_all_subs_requested = Signal()
     new_config_requested = Signal(str)
     edit_config_requested = Signal(object)
     delete_configs_requested = Signal(list)
@@ -1633,6 +1643,7 @@ class ConfigsPage(QWidget):
         self._checked_uids: set[str] = set()
         self._visible_rows: list[tuple[int, str, dict]] = []
         self._syncing_table = False
+        self.setAcceptDrops(True)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(20, 12, 20, 14)
@@ -1681,6 +1692,15 @@ class ConfigsPage(QWidget):
         self.btn_import = ActionPillButton("plus", I18N.t("import_clip_btn"), variant="ghost")
         self.btn_import.clicked.connect(self._import_from_clipboard)
 
+        self.btn_import_file = ActionPillButton("upload", I18N.t("import_file_btn"), variant="ghost")
+        self.btn_import_file.clicked.connect(self._import_from_files)
+
+        self.btn_upd_this_sub = ActionPillButton("refresh", I18N.t("btn_update_this_sub"), variant="ghost")
+        self.btn_upd_this_sub.clicked.connect(self._on_refresh_this_sub)
+
+        self.btn_upd_all_subs = ActionPillButton("refresh", I18N.t("btn_update_all_subs"), variant="emerald")
+        self.btn_upd_all_subs.clicked.connect(self._on_refresh_all_subs)
+
         self.btn_new = ActionPillButton("edit", I18N.t("new_config_btn"), variant="ghost")
         self.btn_new.clicked.connect(self._request_new_in_group)
 
@@ -1709,6 +1729,9 @@ class ConfigsPage(QWidget):
         self.btn_send_lab.clicked.connect(self._send_checked_or_tab_to_lab)
 
         toolbar.addWidget(self.btn_import)
+        toolbar.addWidget(self.btn_import_file)
+        toolbar.addWidget(self.btn_upd_this_sub)
+        toolbar.addWidget(self.btn_upd_all_subs)
         toolbar.addWidget(self.btn_new)
         toolbar.addWidget(self.btn_ping)
         toolbar.addWidget(self.btn_gemini)
@@ -1763,6 +1786,7 @@ class ConfigsPage(QWidget):
 
         self._apply_table_headers()
         self._rebuild_group_tabs()
+        _reorganize_configs_page_toolbars(self)
 
     def _on_hunt_sub_clicked(self) -> None:
         if self._current_group_key not in ("__ALL__", "Manual"):
@@ -1904,7 +1928,11 @@ class ConfigsPage(QWidget):
                 )
                 self.table.setItem(row_i, 1, proto_item)
 
-                raw_name = GeoFlagResolver.clean_display_name(str(p.get("name") or p.get("title") or f"Node #{orig_idx + 1}"))
+                raw_name = GeoFlagResolver.clean_display_name(str(p.get("name") or p.get("title") or ""))
+                if not raw_name:
+                    _cc_fb = GeoFlagResolver.resolve_code(p)
+                    _sp_fb = GeoFlagResolver.get_spec(_cc_fb)
+                    raw_name = f"{proto} • {_sp_fb.localized_name()} ({_cc_fb})" if _cc_fb else f"{proto} • Node #{orig_idx + 1}"
                 prefix = "* " if is_active else ""
                 cc = GeoFlagResolver.resolve_code(p)
                 name_item = QTableWidgetItem(make_flag_qicon(cc, 24, 16), f"{prefix}{raw_name}")
@@ -2024,6 +2052,44 @@ class ConfigsPage(QWidget):
         if 0 <= row < len(self._visible_rows):
             orig_idx, uid, _ = self._visible_rows[row]
             self.select_active_requested.emit(uid if uid else orig_idx)
+
+    def _on_refresh_this_sub(self) -> None:
+        grp = self.active_import_group()
+        self.refresh_single_sub_requested.emit(grp)
+        self.sub_lbl.setText(I18N.t("vault_feedback_sub_single", group=grp))
+
+    def _on_refresh_all_subs(self) -> None:
+        self.refresh_all_subs_requested.emit()
+        self.sub_lbl.setText(I18N.t("vault_feedback_sub_all"))
+
+    def _import_from_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            I18N.t("import_file_dlg_title"),
+            "",
+            "Config Files (*.txt *.sub *.conf *.json);;All Files (*.*)",
+        )
+        if files:
+            grp = self.active_import_group()
+            self.import_files_requested.emit(list(files), grp)
+            self.sub_lbl.setText(I18N.t("vault_feedback_imported_files", n=len(files), group=grp))
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+        else:
+            super().dragEnterEvent(event)
+
+    def dropEvent(self, event) -> None:
+        urls = event.mimeData().urls() if event.mimeData().hasUrls() else []
+        local_files = [u.toLocalFile() for u in urls if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
+        if local_files:
+            grp = self.active_import_group()
+            self.import_files_requested.emit(local_files, grp)
+            self.sub_lbl.setText(I18N.t("vault_feedback_imported_files", n=len(local_files), group=grp))
+            event.acceptProposedAction()
+        else:
+            super().dropEvent(event)
 
     def _import_from_clipboard(self) -> None:
         clip = QGuiApplication.clipboard().text().strip()
@@ -2149,6 +2215,9 @@ class ConfigsPage(QWidget):
         self.hunt_sub_btn.set_label_text(I18N.t("hunt_sub_btn"))
         self.manage_subs_btn.set_label_text(I18N.t("manage_subs_btn"))
         self.btn_import.set_label_text(I18N.t("import_clip_btn"))
+        self.btn_import_file.set_label_text(I18N.t("import_file_btn"))
+        self.btn_upd_this_sub.set_label_text(I18N.t("btn_update_this_sub"))
+        self.btn_upd_all_subs.set_label_text(I18N.t("btn_update_all_subs"))
         self.btn_new.set_label_text(I18N.t("new_config_btn"))
         self.btn_ping.set_label_text(I18N.t("ping_btn"))
         self.btn_gemini.set_label_text(I18N.t("probe_gemini_btn"))
@@ -2160,6 +2229,8 @@ class ConfigsPage(QWidget):
         self._apply_table_headers()
         self._rebuild_group_tabs()
         self._rebuild_table()
+        for _fl in self.findChildren(JustifiedFlowLayout):
+            _fl.invalidate()
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -2169,6 +2240,9 @@ class ConfigsPage(QWidget):
             self.hunt_sub_btn,
             self.manage_subs_btn,
             self.btn_import,
+            self.btn_import_file,
+            self.btn_upd_this_sub,
+            self.btn_upd_all_subs,
             self.btn_new,
             self.btn_ping,
             self.btn_gemini,
@@ -2180,7 +2254,7 @@ class ConfigsPage(QWidget):
 
 
 class LabPage(QWidget):
-    start_lab_scan_requested = Signal(str, list, str, str, bool, bool)
+    start_lab_scan_requested = Signal(str, list, str, str, bool, bool, bool)
     start_clean_ip_requested = Signal(int)
     start_doh_scan_requested = Signal()
     add_doh_custom_requested = Signal(str)
@@ -2277,6 +2351,9 @@ class LabPage(QWidget):
         self.chk_autoconnect = QCheckBox(I18N.t("chk_lab_autoconnect"))
         self.chk_autoconnect.setChecked(False)
 
+        self.chk_clean_ip = QCheckBox(I18N.t("chk_lab_clean_ip"))
+        self.chk_clean_ip.setChecked(False)
+
         self.sw_winners_only = AnimatedToggleSwitch(checked=True)
         self.sw_winners_only.toggled.connect(lambda _c: self._render_lab_table())
         self.lbl_winners_only = QLabel(I18N.t("sw_winners_only"))
@@ -2290,6 +2367,7 @@ class LabPage(QWidget):
 
         r2.addWidget(self.chk_gemini)
         r2.addWidget(self.chk_autoconnect)
+        r2.addWidget(self.chk_clean_ip)
         r2.addSpacing(8)
         r2.addWidget(self.sw_winners_only)
         r2.addWidget(self.lbl_winners_only)
@@ -2299,7 +2377,7 @@ class LabPage(QWidget):
         cfg_vbox.addLayout(r2)
         vec_vbox.addWidget(self.cfg_card)
 
-        self.lab_table = QTableWidget(0, 7)
+        self.lab_table = QTableWidget(0, 8)
         self.lab_table.setObjectName("VaultTable")
         self.lab_table.setAlternatingRowColors(True)
         self.lab_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -2312,8 +2390,9 @@ class LabPage(QWidget):
         lh.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         lh.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         lh.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        lh.setSectionResizeMode(6, QHeaderView.ResizeMode.Fixed)
-        self.lab_table.setColumnWidth(6, 136)
+        lh.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        lh.setSectionResizeMode(7, QHeaderView.ResizeMode.Fixed)
+        self.lab_table.setColumnWidth(7, 136)
         vec_vbox.addWidget(self.lab_table, 1)
 
         radar_page = QWidget()
@@ -2445,6 +2524,7 @@ class LabPage(QWidget):
         self.set_vectors([])
         self._apply_table_headers()
         self._sync_scope_selectors()
+        _auto_justify_button_bars(self)
 
     def set_doh_repositories(self, repos: list) -> None:
         if self._doh_rows:
@@ -2552,7 +2632,8 @@ class LabPage(QWidget):
                 I18N.t("lab_col_profile"),
                 I18N.t("lab_col_vector"),
                 I18N.t("lab_col_ping"),
-                I18N.t("lab_col_upload"),
+                I18N.t("lab_col_upload_speed"),
+                I18N.t("lab_col_gemini"),
                 I18N.t("lab_col_status"),
                 I18N.t("lab_col_action"),
             ]
@@ -2649,7 +2730,8 @@ class LabPage(QWidget):
             uids = [cur_uid] if cur_uid else []
             grp = ""
 
-        self.start_lab_scan_requested.emit(scope, uids, grp, selected_vector_id, chk_gem, auto_conn)
+        use_clean_ip = bool(self.chk_clean_ip.isChecked())
+        self.start_lab_scan_requested.emit(scope, uids, grp, selected_vector_id, chk_gem, auto_conn, use_clean_ip)
 
     def _on_run_or_stop_radar(self) -> None:
         if self._is_running:
@@ -2781,23 +2863,49 @@ class LabPage(QWidget):
                 )
                 self.lab_table.setItem(r_idx, 3, p_item)
 
-                up_ok = get_bool(row, "upload_ok", is_ok)
-                gem = is_gemini_verified(row)
-                up_str = f"UL:{'OK' if up_ok else '---'} | {'Gemini' if gem else 'AI:---'}"
-                up_item = QTableWidgetItem(up_str)
-                up_item.setFont(make_mono_font(9))
+                up_kbps = float(row.get("upload_kbps") or 0.0)
+                up_ok = get_bool(row, "upload_ok", False) or (up_kbps > 0.0)
+                if up_kbps >= 1024.0:
+                    up_txt = f"{up_kbps / 1024.0:.2f} MB/s"
+                    up_col = QColor(self._palette.emerald)
+                elif up_kbps >= 120.0:
+                    up_txt = f"{up_kbps:.0f} KB/s"
+                    up_col = QColor(self._palette.emerald)
+                elif up_kbps > 0.0:
+                    up_txt = f"{up_kbps:.0f} KB/s"
+                    up_col = QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309")
+                elif is_ok and up_ok:
+                    up_txt = "OK"
+                    up_col = QColor(self._palette.emerald)
+                else:
+                    up_txt = "STALLED" if (ping > 0 and not is_ok) else "---"
+                    up_col = QColor(self._palette.danger) if (ping > 0 and not is_ok) else QColor(self._palette.text_muted)
+
+                up_item = QTableWidgetItem(up_txt)
+                up_item.setFont(mono)
                 up_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-                up_item.setForeground(
-                    QColor(self._palette.emerald) if gem else QColor(self._palette.text_secondary)
-                )
+                up_item.setForeground(up_col)
                 self.lab_table.setItem(r_idx, 4, up_item)
 
-                verdict = "TRUE (VERIFIED)" if is_ok else str(row.get("status") or "FAILED").upper()
+                gem = is_gemini_verified(row)
+                gem_raw = str(row.get("gemini_status") or "").strip().upper()
+                gem_txt = "OK" if gem else ("BLOCKED" if gem_raw in ("BLOCKED", "FAIL") else "---")
+                gem_item = QTableWidgetItem(gem_txt)
+                gem_item.setFont(make_mono_font(9, bold=gem))
+                gem_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                gem_item.setForeground(
+                    QColor(self._palette.emerald)
+                    if gem
+                    else (QColor(self._palette.danger) if gem_txt == "BLOCKED" else QColor(self._palette.text_muted))
+                )
+                self.lab_table.setItem(r_idx, 5, gem_item)
+
+                verdict = "VERIFIED" if is_ok else str(row.get("status") or "FAILED").upper()
                 v_item = QTableWidgetItem(verdict)
                 v_item.setFont(mono)
                 v_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 v_item.setForeground(QColor(self._palette.emerald) if is_ok else QColor(self._palette.danger))
-                self.lab_table.setItem(r_idx, 5, v_item)
+                self.lab_table.setItem(r_idx, 6, v_item)
 
                 target_uid = str(row.get("target_uid") or row.get("uid") or "")
                 btn_conn = QPushButton(I18N.t("btn_connect_now"))
@@ -2811,7 +2919,7 @@ class LabPage(QWidget):
                 cl = QHBoxLayout(cell_w)
                 cl.setContentsMargins(6, 3, 6, 3)
                 cl.addWidget(btn_conn)
-                self.lab_table.setCellWidget(r_idx, 6, cell_w)
+                self.lab_table.setCellWidget(r_idx, 7, cell_w)
         finally:
             self.lab_table.setUpdatesEnabled(True)
 
@@ -2936,6 +3044,7 @@ class LabPage(QWidget):
         self.set_vectors(self._vectors)
         self.chk_gemini.setText(I18N.t("chk_lab_gemini"))
         self.chk_autoconnect.setText(I18N.t("chk_lab_autoconnect"))
+        self.chk_clean_ip.setText(I18N.t("chk_lab_clean_ip"))
         self.lbl_winners_only.setText(I18N.t("sw_winners_only"))
         self.radar_port_lbl.setText(I18N.t("radar_port_lbl"))
         self.btn_apply_sel_ip.setText(I18N.t("btn_apply_sel_cdn"))
@@ -2948,6 +3057,8 @@ class LabPage(QWidget):
         self._apply_table_headers()
         self._render_lab_table()
         self._render_doh_table()
+        for _fl in self.findChildren(JustifiedFlowLayout):
+            _fl.invalidate()
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -3018,6 +3129,7 @@ class RoutingSettingsPage(QWidget):
         self.stack.addWidget(self._build_per_app_tab())
         self.stack.addWidget(self._build_behavior_tab())
         self.stack.addWidget(self._build_core_tab())
+        _auto_justify_button_bars(self)
 
     def _build_routing_tab(self) -> QWidget:
         host = QWidget()
@@ -3165,13 +3277,20 @@ class RoutingSettingsPage(QWidget):
         ah.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         ah.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
         self.app_table.setColumnWidth(4, 152)
+        self.lbl_pa_stats = QLabel(I18N.t("per_app_stats_fmt", tun=0, dir=0))
+        self.lbl_pa_stats.setObjectName("EmeraldPill")
+        enforce_english_ltr(self.lbl_pa_stats, mono_size=9, bold=True)
+        self.sw_winhttp_sync = self._add_switch_item(
+            cv, "per_app_winhttp_sync", "sw_winhttp_sync", "sw_winhttp_sync_desc", False
+        )
+        cv.addWidget(self.lbl_pa_stats)
         cv.addWidget(self.app_table, 1)
 
         self.lbl_pa_manual = QLabel(I18N.t("per_app_manual_lbl"))
         self.lbl_pa_manual.setObjectName("SecondaryLabel")
         self.per_app_list_edit = QPlainTextEdit("")
         self.per_app_list_edit.setObjectName("CodeEditor")
-        self.per_app_list_edit.setPlaceholderText("Claude.exe\nCursor.exe\nChatGPT.exe\nTelegram.exe")
+        self.per_app_list_edit.setPlaceholderText("Telegram.exe\nchrome.exe\nDiscord.exe\nCode.exe")
         self.per_app_list_edit.setMaximumHeight(74)
         enforce_english_ltr(self.per_app_list_edit, mono_size=9)
         self.per_app_list_edit.textChanged.connect(self._schedule_domain_emit)
@@ -3215,6 +3334,10 @@ class RoutingSettingsPage(QWidget):
                 out.add(tok)
         return out
 
+    def update_per_app_stats(self, tunneled: int, bypassed: int) -> None:
+        if hasattr(self, "lbl_pa_stats"):
+            self.lbl_pa_stats.setText(I18N.t("per_app_stats_fmt", tun=int(tunneled), dir=int(bypassed)))
+
     def set_discovered_apps(self, apps: list) -> None:
         self._discovered_apps = [dict(a) for a in (apps or []) if isinstance(a, dict)]
         self._render_app_table()
@@ -3246,7 +3369,7 @@ class RoutingSettingsPage(QWidget):
 
                 nm_it = QTableWidgetItem(title)
                 nm_it.setFont(make_ui_font(10, QFont.Weight.Bold))
-                if "AI" in cat:
+                if st == "ACTIVE_NET":
                     nm_it.setForeground(QColor(self._palette.accent_primary if self._palette.is_dark else "#B45309"))
                 self.app_table.setItem(r_idx, 1, nm_it)
 
@@ -3259,7 +3382,7 @@ class RoutingSettingsPage(QWidget):
                 cat_it.setFont(mono)
                 cat_it.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 cat_it.setForeground(
-                    QColor(self._palette.emerald) if st == "RUNNING" else QColor(self._palette.text_muted)
+                    QColor(self._palette.emerald) if st in ("ACTIVE_NET", "RUNNING") else QColor(self._palette.text_muted)
                 )
                 self.app_table.setItem(r_idx, 3, cat_it)
 
@@ -3466,7 +3589,7 @@ class RoutingSettingsPage(QWidget):
 
         self.mtu_spin = QSpinBox()
         self.mtu_spin.setRange(1280, 9000)
-        self.mtu_spin.setValue(1500)
+        self.mtu_spin.setValue(1360)
         enforce_english_ltr(self.mtu_spin, mono_size=10)
 
         self.socks_spin = QSpinBox()
@@ -3663,6 +3786,7 @@ class RoutingSettingsPage(QWidget):
         try:
             for sw, key in (
                 (self.sw_block_quic, "block_quic"),
+                (self.sw_winhttp_sync, "per_app_winhttp_sync"),
                 (self.sw_min_tray, "minimize_to_tray"),
                 (self.sw_pool_fallback, "auto_pool_fallback"),
                 (self.sw_yt_guard, "require_youtube_6s"),
@@ -3760,6 +3884,7 @@ class RoutingSettingsPage(QWidget):
             "routing_mode": str(self.routing_mode_combo.currentData() or "bypass_ir"),
             "per_app_mode": str(self.per_app_mode_combo.currentData() or "off"),
             "per_app_list": self.per_app_list_edit.toPlainText().strip(),
+            "per_app_winhttp_sync": bool(self.sw_winhttp_sync.isChecked()),
             "block_quic": bool(self.sw_block_quic.isChecked()),
             "remote_dns": self.remote_dns_edit.text().strip() or "https://1.1.1.1/dns-query",
             "domestic_dns": self.domestic_dns_edit.text().strip() or "178.22.122.100",
@@ -3834,6 +3959,8 @@ class RoutingSettingsPage(QWidget):
         self._render_app_table()
         self._populate_behavior_combos()
         self._populate_core_combos()
+        for _fl in self.findChildren(JustifiedFlowLayout):
+            _fl.invalidate()
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -3899,6 +4026,7 @@ class LogsPage(QWidget):
         self.console.setReadOnly(True)
         enforce_english_ltr(self.console, mono_size=10)
         root.addWidget(self.console, 1)
+        _auto_justify_button_bars(self)
 
     def _on_filter_mode(self, idx: int) -> None:
         self._warn_only = (idx == 1)
@@ -3947,7 +4075,565 @@ class LogsPage(QWidget):
         self.copy_btn.setText(I18N.t("logs_copy"))
         self.clear_btn.setText(I18N.t("logs_clear"))
         self.save_btn.setText(I18N.t("logs_save"))
+        for _fl in self.findChildren(JustifiedFlowLayout):
+            _fl.invalidate()
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self.top_card.set_palette_theme(palette)
         self.filter_seg.set_palette_theme(palette)
+
+
+class AboutPage(QWidget):
+    check_update_requested = Signal()
+
+    LINKS_SPEC = [
+        ("about_repo_win", "GitHub — Alan-RIP-Dpi-Windows", "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows", "globe"),
+        ("about_repo_android", "GitHub — Alan-RIP-Dpi-Android", "https://github.com/DrAlanK/Alan-RIP-Dpi-Android", "bolt"),
+        ("about_core_xray", "Core Engine — XTLS / Xray-core", "https://github.com/XTLS/Xray-core", "configs"),
+        ("about_telegram", "Telegram Channel — @LabALan", "https://t.me/LabALan", "wave"),
+        ("about_credit_floxu", "Acknowledgment — Floxu1 (OOB Method)", "https://github.com/Floxu1/", "shield_check"),
+        ("about_credit_wintun", "TUN Driver — WireGuard Wintun", "https://www.wintun.net/", "routing"),
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._palette: ThemePalette = DARK_PALETTE
+        self._latest_download_url = "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest"
+        self._cards: list[NeuCard] = []
+        self._link_buttons: list[tuple[ActionPillButton, str, str]] = []
+        self._link_labels: list[tuple[QLabel, str]] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 12, 20, 14)
+        root.setSpacing(12)
+
+        host = QWidget()
+        vbox = QVBoxLayout(host)
+        vbox.setContentsMargins(0, 2, 6, 8)
+        vbox.setSpacing(12)
+
+        # Hero Brand & Version Card
+        brand_card = NeuCard(mode="raised", radius=20.0, depth=5.5, pad=6.5)
+        self._cards.append(brand_card)
+        b_row = QHBoxLayout(brand_card)
+        b_row.setContentsMargins(24, 20, 24, 20)
+        b_row.setSpacing(16)
+
+        self.logo_glyph = VectorGlyph("shield_check", size=54, custom_hex="#FFD000")
+        b_col = QVBoxLayout()
+        b_col.setSpacing(4)
+        t_line = QHBoxLayout()
+        t_line.setSpacing(10)
+        self.title_lbl = QLabel("Alan-RIP-Dpi")
+        self.title_lbl.setObjectName("PageTitle")
+        self.ver_pill = QLabel("v1.5.0")
+        self.ver_pill.setObjectName("EmeraldPill")
+        enforce_english_ltr(self.ver_pill, mono_size=10, bold=True)
+        t_line.addWidget(self.title_lbl)
+        t_line.addWidget(self.ver_pill)
+        t_line.addStretch()
+
+        self.desc_lbl = QLabel(I18N.t("about_subtitle"))
+        self.desc_lbl.setObjectName("MutedLabel")
+        self.desc_lbl.setWordWrap(True)
+        b_col.addLayout(t_line)
+        b_col.addWidget(self.desc_lbl)
+
+        b_row.addWidget(self.logo_glyph, 0, Qt.AlignmentFlag.AlignVCenter)
+        b_row.addLayout(b_col, 1)
+        vbox.addWidget(brand_card)
+
+        # Auto-Update Checker Card
+        upd_card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._cards.append(upd_card)
+        u_vbox = QVBoxLayout(upd_card)
+        u_vbox.setContentsMargins(22, 18, 22, 18)
+        u_vbox.setSpacing(10)
+
+        u_top = QHBoxLayout()
+        u_top.setSpacing(12)
+        u_txt_col = QVBoxLayout()
+        u_txt_col.setSpacing(3)
+        self.upd_title_lbl = QLabel(I18N.t("about_upd_title"))
+        self.upd_title_lbl.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        self.upd_status_lbl = QLabel(I18N.t("about_upd_idle"))
+        self.upd_status_lbl.setObjectName("SecondaryLabel")
+        u_txt_col.addWidget(self.upd_title_lbl)
+        u_txt_col.addWidget(self.upd_status_lbl)
+
+        self.btn_check_upd = ActionPillButton("refresh", I18N.t("about_check_update"), variant="gold")
+        self.btn_check_upd.clicked.connect(self._on_check_clicked)
+
+        self.btn_download_upd = ActionPillButton("download", I18N.t("about_download_btn"), variant="emerald")
+        self.btn_download_upd.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self._latest_download_url)))
+        self.btn_download_upd.hide()
+
+        u_top.addLayout(u_txt_col, 1)
+        u_top.addWidget(self.btn_download_upd)
+        u_top.addWidget(self.btn_check_upd)
+        u_vbox.addLayout(u_top)
+
+        self.upd_notes_box = QPlainTextEdit()
+        self.upd_notes_box.setObjectName("CodeEditor")
+        self.upd_notes_box.setReadOnly(True)
+        self.upd_notes_box.setMaximumHeight(110)
+        self.upd_notes_box.hide()
+        u_vbox.addWidget(self.upd_notes_box)
+        vbox.addWidget(upd_card)
+
+        # Links & Ecosystem Card
+        links_card = NeuCard(mode="raised", radius=18.0, depth=5.2, pad=6.5)
+        self._cards.append(links_card)
+        l_vbox = QVBoxLayout(links_card)
+        l_vbox.setContentsMargins(22, 18, 22, 18)
+        l_vbox.setSpacing(10)
+
+        self.links_hdr_lbl = QLabel(I18N.t("about_links_title"))
+        self.links_hdr_lbl.setFont(make_ui_font(11, QFont.Weight.ExtraBold))
+        l_vbox.addWidget(self.links_hdr_lbl)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(10)
+
+        for idx, (i18n_k, sub_url_lbl, url_str, ic_name) in enumerate(self.LINKS_SPEC):
+            item_card = NeuCard(mode="inset", radius=14.0, depth=3.4, pad=3.5)
+            self._cards.append(item_card)
+            ir = QHBoxLayout(item_card)
+            ir.setContentsMargins(14, 10, 14, 10)
+            ir.setSpacing(10)
+
+            ic_col = QVBoxLayout()
+            ic_col.setSpacing(2)
+            lbl = QLabel(I18N.t(i18n_k))
+            lbl.setFont(make_ui_font(10, QFont.Weight.Bold))
+            self._link_labels.append((lbl, i18n_k))
+
+            url_lbl = QLabel(sub_url_lbl)
+            url_lbl.setObjectName("MutedLabel")
+            enforce_english_ltr(url_lbl, mono_size=8)
+            ic_col.addWidget(lbl)
+            ic_col.addWidget(url_lbl)
+
+            open_btn = ActionPillButton(ic_name, I18N.t("about_open_link"), variant="ghost")
+            open_btn.clicked.connect(lambda _c=False, u=url_str: QDesktopServices.openUrl(QUrl(u)))
+            self._link_buttons.append((open_btn, i18n_k, url_str))
+
+            ir.addLayout(ic_col, 1)
+            ir.addWidget(open_btn)
+            grid.addWidget(item_card, idx // 2, idx % 2)
+
+        l_vbox.addLayout(grid)
+        vbox.addWidget(links_card)
+        vbox.addStretch()
+
+        root.addWidget(make_transparent_scroll_area(host), 1)
+
+    def _on_check_clicked(self) -> None:
+        self.btn_check_upd.setEnabled(False)
+        self.upd_status_lbl.setText(I18N.t("about_checking"))
+        self.check_update_requested.emit()
+
+    def apply_update_result(self, info: dict) -> None:
+        self.btn_check_upd.setEnabled(True)
+        if not isinstance(info, dict):
+            return
+        cur_v = str(info.get("current_version") or "1.5.0")
+        lat_v = str(info.get("latest_version") or cur_v)
+        self.ver_pill.setText(f"v{cur_v}")
+
+        if not info.get("ok"):
+            err = str(info.get("error") or "Network Error")
+            self.upd_status_lbl.setText(I18N.t("about_error", err=err))
+            self.btn_download_upd.hide()
+            return
+
+        rel_url = str(info.get("download_url") or info.get("release_url") or self._latest_download_url)
+        self._latest_download_url = rel_url
+        notes = str(info.get("notes") or "").strip()
+
+        if info.get("has_update"):
+            self.upd_status_lbl.setText(I18N.t("about_new_ver", ver=lat_v))
+            self.btn_download_upd.set_label_text(f"{I18N.t('about_download_btn')} (v{lat_v})")
+            self.btn_download_upd.show()
+            if notes:
+                self.upd_notes_box.setPlainText(notes)
+                self.upd_notes_box.show()
+        else:
+            self.upd_status_lbl.setText(I18N.t("about_up_to_date", ver=cur_v))
+            self.btn_download_upd.hide()
+            self.upd_notes_box.hide()
+
+    def retranslate_ui(self) -> None:
+        self.desc_lbl.setText(I18N.t("about_subtitle"))
+        self.upd_title_lbl.setText(I18N.t("about_upd_title"))
+        self.btn_check_upd.set_label_text(I18N.t("about_check_update"))
+        self.btn_download_upd.set_label_text(I18N.t("about_download_btn"))
+        self.links_hdr_lbl.setText(I18N.t("about_links_title"))
+        for lbl, key in self._link_labels:
+            lbl.setText(I18N.t(key))
+        for btn, _k, _u in self._link_buttons:
+            btn.set_label_text(I18N.t("about_open_link"))
+
+    def set_palette_theme(self, palette: ThemePalette) -> None:
+        self._palette = palette
+        self.logo_glyph.set_palette_theme(palette, "#FFD000")
+        for c in self._cards:
+            c.set_palette_theme(palette)
+        self.btn_check_upd.set_palette_theme(palette)
+        self.btn_download_upd.set_palette_theme(palette)
+        for btn, _k, _u in self._link_buttons:
+            btn.set_palette_theme(palette)
+
+
+def _drain_layout_widgets(layout) -> list:
+    widgets = []
+    if layout is None:
+        return widgets
+    while layout.count():
+        item = layout.takeAt(0)
+        if item is None:
+            continue
+        w = item.widget()
+        if w is not None:
+            widgets.append(w)
+        else:
+            sub = item.layout()
+            if sub is not None:
+                widgets.extend(_drain_layout_widgets(sub))
+    return widgets
+
+
+def _find_widget_parent_layout(layout, target_widget):
+    if layout is None or target_widget is None:
+        return None, -1
+    for i in range(layout.count()):
+        item = layout.itemAt(i)
+        if item is None:
+            continue
+        if item.widget() is target_widget:
+            return layout, i
+        sub = item.layout()
+        if sub is not None:
+            fl, fi = _find_widget_parent_layout(sub, target_widget)
+            if fl is not None:
+                return fl, fi
+        wdg = item.widget()
+        if wdg is not None and wdg.layout() is not None:
+            fl, fi = _find_widget_parent_layout(wdg.layout(), target_widget)
+            if fl is not None:
+                return fl, fi
+    return None, -1
+
+
+def _find_child_layout_parent(root_layout, target_layout):
+    if root_layout is None or target_layout is None:
+        return None, -1
+    for i in range(root_layout.count()):
+        item = root_layout.itemAt(i)
+        if item is None:
+            continue
+        sub = item.layout()
+        if sub is target_layout:
+            return root_layout, i
+        if sub is not None:
+            fl, fi = _find_child_layout_parent(sub, target_layout)
+            if fl is not None:
+                return fl, fi
+        wdg = item.widget()
+        if wdg is not None and wdg.layout() is not None:
+            fl, fi = _find_child_layout_parent(wdg.layout(), target_layout)
+            if fl is not None:
+                return fl, fi
+    return None, -1
+
+
+def _replace_container_layout(container: QWidget, new_layout) -> None:
+    old_lay = container.layout()
+    if old_lay is not None:
+        dummy = QWidget()
+        dummy.setLayout(old_lay)
+        dummy.deleteLater()
+    container.setLayout(new_layout)
+    container.setMinimumHeight(0)
+    container.setMaximumHeight(16777215)
+    sp = container.sizePolicy()
+    container.setSizePolicy(sp.horizontalPolicy(), QSizePolicy.Policy.Preferred)
+
+
+def _extract_widget_caption(w: QWidget) -> str:
+    for attr in ("_label", "_text_lbl", "lbl"):
+        sub = getattr(w, attr, None)
+        if sub is not None and hasattr(sub, "text"):
+            return str(sub.text() or "").strip()
+    if hasattr(w, "_text"):
+        return str(getattr(w, "_text") or "").strip()
+    if hasattr(w, "text"):
+        try:
+            return str(w.text() or "").strip()
+        except Exception:
+            pass
+    return ""
+
+
+def _auto_justify_button_bars(root_widget, skip_widgets=None) -> int:
+    """
+    Traverses the full widget hierarchy — including QTabWidget, QScrollArea,
+    QStackedWidget, and NeuCard containers — converting crowded QHBoxLayout
+    button rows into responsive JustifiedFlowLayout rows.
+    """
+    from PySide6.QtWidgets import (
+        QAbstractButton,
+        QComboBox,
+        QLineEdit,
+        QPlainTextEdit,
+        QProgressBar,
+        QScrollArea,
+        QSlider,
+        QSpinBox,
+        QStackedWidget,
+        QTableWidget,
+        QTabWidget,
+        QTextEdit,
+    )
+
+    skip_set = set(skip_widgets or ())
+    disqualifying_types = (
+        QLineEdit,
+        QPlainTextEdit,
+        QTextEdit,
+        QTableWidget,
+        QScrollArea,
+        QTabWidget,
+        QSlider,
+        QProgressBar,
+        QSpinBox,
+    )
+
+    widget_root_targets = []
+    sub_layout_targets = []
+    visited_layouts = set()
+    visited_widgets = set()
+
+    def _is_crowded_button_row(hlay: QHBoxLayout) -> bool:
+        wdgs = []
+        for j in range(hlay.count()):
+            it = hlay.itemAt(j)
+            if it is None:
+                continue
+            if it.layout() is not None:
+                return False
+            w = it.widget()
+            if w is not None:
+                wdgs.append(w)
+        if len(wdgs) < 3:
+            return False
+        if any(w in skip_set for w in wdgs):
+            return False
+        if any(isinstance(w, disqualifying_types) for w in wdgs):
+            return False
+
+        btn_cnt = 0
+        for w in wdgs:
+            if isinstance(w, QAbstractButton):
+                btn_cnt += 1
+            elif isinstance(w, QComboBox):
+                continue
+            elif isinstance(w, QLabel):
+                if w.objectName() in ("PageTitle", "HeroHeadline", "SectionTitle"):
+                    return False
+            else:
+                return False
+        return btn_cnt >= 2 and len(wdgs) >= 3
+
+    def _walk_widget(wdg: QWidget):
+        if wdg is None or id(wdg) in visited_widgets:
+            return
+        visited_widgets.add(id(wdg))
+
+        if isinstance(wdg, QScrollArea):
+            inner = wdg.widget()
+            if inner is not None:
+                _walk_widget(inner)
+            return
+
+        if isinstance(wdg, (QTabWidget, QStackedWidget)):
+            for idx_t in range(wdg.count()):
+                _walk_widget(wdg.widget(idx_t))
+            return
+
+        if wdg.layout() is not None:
+            _walk_layout(wdg.layout(), owner_widget=wdg)
+
+    def _walk_layout(lay, owner_widget=None):
+        if lay is None or id(lay) in visited_layouts:
+            return
+        visited_layouts.add(id(lay))
+
+        if isinstance(lay, QHBoxLayout) and owner_widget is not None and owner_widget is not root_widget:
+            if _is_crowded_button_row(lay):
+                widget_root_targets.append((owner_widget, lay))
+                return
+
+        for i in range(lay.count()):
+            item = lay.itemAt(i)
+            if item is None:
+                continue
+            sub = item.layout()
+            if sub is not None:
+                if isinstance(lay, QVBoxLayout) and isinstance(sub, QHBoxLayout) and _is_crowded_button_row(sub):
+                    sub_layout_targets.append((lay, sub))
+                    continue
+                _walk_layout(sub, owner_widget=None)
+            wdg = item.widget()
+            if wdg is not None:
+                _walk_widget(wdg)
+
+    _walk_widget(root_widget)
+
+    converted = 0
+    for card_w, old_h in widget_root_targets:
+        wdgs = _drain_layout_widgets(old_h)
+        m = old_h.contentsMargins()
+        flow = JustifiedFlowLayout(h_spacing=8, v_spacing=8, justify=True)
+        flow.setContentsMargins(m)
+        _replace_container_layout(card_w, flow)
+        for w in wdgs:
+            w.setParent(card_w)
+            flow.addWidget(w)
+        converted += 1
+
+    for parent_v, old_h in sub_layout_targets:
+        cur_idx = -1
+        for k in range(parent_v.count()):
+            if parent_v.itemAt(k).layout() is old_h:
+                cur_idx = k
+                break
+        if cur_idx < 0:
+            continue
+        wdgs = _drain_layout_widgets(old_h)
+        m = old_h.contentsMargins()
+        parent_v.takeAt(cur_idx)
+        flow = JustifiedFlowLayout(h_spacing=8, v_spacing=8, justify=True)
+        flow.setContentsMargins(m)
+        for w in wdgs:
+            flow.addWidget(w)
+        parent_v.insertLayout(cur_idx, flow)
+        converted += 1
+
+    return converted
+
+
+def _reorganize_configs_page_toolbars(page) -> None:
+    """
+    Splits ConfigsPage's crowded 11-button bar into 3 balanced zones:
+      1) Group Tabs Strip + [Update This Sub] [Update All Subs]
+      2) Primary Action Bar (JustifiedFlowLayout): 6 core actions
+      3) Search Row: [Select All] [Search Box] [Sort Ping] [Remove Dupes] [Prune Dead]
+    """
+    root = page.layout()
+    btn_import = getattr(page, "btn_import", None)
+    if root is None or btn_import is None:
+        return
+
+    old_tb, _ = _find_widget_parent_layout(root, btn_import)
+    if old_tb is None or isinstance(old_tb, JustifiedFlowLayout):
+        return
+
+    tb_owner = old_tb.parentWidget()
+    is_card_root = (tb_owner is not None) and (tb_owner is not page) and (tb_owner.layout() is old_tb)
+
+    if is_card_root:
+        tb_parent, tb_idx = _find_widget_parent_layout(root, tb_owner)
+    else:
+        tb_parent, tb_idx = _find_child_layout_parent(root, old_tb)
+
+    all_tb_widgets = _drain_layout_widgets(old_tb)
+    old_margins = old_tb.contentsMargins()
+
+    # Map widget -> attribute name on page for reliable classification
+    attr_by_id = {id(val): key.lower() for key, val in vars(page).items() if isinstance(val, QWidget)}
+
+    sub_btns = []
+    maint_btns = []
+    primary_btns = []
+
+    for w in all_tb_widgets:
+        aname = attr_by_id.get(id(w), "")
+        cap = _extract_widget_caption(w).lower()
+
+        if aname in ("btn_upd_this_sub", "btn_upd_all_subs") or any(
+            k in cap for k in ("همین ساب", "کل ساب", "update this sub", "update all sub")
+        ):
+            sub_btns.append(w)
+        elif any(k in aname for k in ("sort", "dedup", "dup", "prune", "dead", "clean")) or any(
+            k in cap for k in ("مرتب", "تکراری", "خراب", "sort", "dup", "prune", "dead")
+        ):
+            maint_btns.append(w)
+        else:
+            primary_btns.append(w)
+
+    # 1. Install JustifiedFlowLayout with ONLY the 6 primary buttons
+    primary_flow = JustifiedFlowLayout(h_spacing=8, v_spacing=8, justify=True)
+    primary_flow.setContentsMargins(old_margins)
+
+    if is_card_root:
+        _replace_container_layout(tb_owner, primary_flow)
+        target_parent_w = tb_owner
+    else:
+        if tb_parent is not None and tb_idx >= 0:
+            tb_parent.takeAt(tb_idx)
+            tb_parent.insertLayout(tb_idx, primary_flow)
+        target_parent_w = page
+
+    for w in primary_btns:
+        w.setParent(target_parent_w)
+        primary_flow.addWidget(w)
+
+    # 2. Relocate 'Update This Sub' & 'Update All Subs' beside the Group Tabs card
+    placed_subs = False
+    if sub_btns and isinstance(tb_parent, QVBoxLayout) and tb_idx > 0:
+        prev_item = tb_parent.itemAt(tb_idx - 1)
+        prev_w = prev_item.widget() if prev_item is not None else None
+        if prev_w is not None:
+            tb_parent.takeAt(tb_idx - 1)
+            tabs_outer = QHBoxLayout()
+            tabs_outer.setContentsMargins(0, 0, 0, 0)
+            tabs_outer.setSpacing(8)
+            tabs_outer.addWidget(prev_w, 1)
+            for sb in sub_btns:
+                sb.setParent(page)
+                tabs_outer.addWidget(sb, 0, Qt.AlignmentFlag.AlignVCenter)
+            tb_parent.insertLayout(tb_idx - 1, tabs_outer)
+            placed_subs = True
+
+    if sub_btns and not placed_subs:
+        for sb in sub_btns:
+            sb.setParent(target_parent_w)
+            primary_flow.addWidget(sb)
+
+    # 3. Relocate 'Sort Ping', 'Remove Dupes', 'Prune Dead' right next to Search Bar
+    from PySide6.QtWidgets import QLineEdit
+    search_edit = getattr(page, "search_edit", None)
+    if search_edit is None:
+        edits = page.findChildren(QLineEdit)
+        search_edit = edits[0] if edits else None
+
+    if maint_btns:
+        s_parent, _ = _find_widget_parent_layout(root, search_edit)
+        if isinstance(s_parent, QHBoxLayout):
+            s_owner = s_parent.parentWidget() or page
+            if search_edit is not None:
+                search_edit.setMinimumWidth(180)
+                search_edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                s_parent.setStretchFactor(search_edit, 1)
+            for mb in maint_btns:
+                mb.setParent(s_owner)
+                s_parent.addWidget(mb)
+        else:
+            for mb in maint_btns:
+                mb.setParent(target_parent_w)
+                primary_flow.addWidget(mb)
+
+    skip_w = set(sub_btns) | set(maint_btns) | ({search_edit} if search_edit is not None else set())
+    _auto_justify_button_bars(page, skip_widgets=skip_w)

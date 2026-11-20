@@ -1,3 +1,4 @@
+import random
 import math
 import re
 from collections import deque
@@ -8,7 +9,7 @@ from PySide6.QtCore import (
     QObject,
     QPointF,
     QPropertyAnimation,
-    QRectF,
+    QRect, QRectF,
     QSize,
     Qt,
     QTimer,
@@ -31,6 +32,8 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QProgressBar,
+    QCheckBox,
+    QLayout,
     QPushButton,
     QSizePolicy,
     QWidget,
@@ -375,11 +378,13 @@ class ActionPillButton(QPushButton):
         self.setMinimumHeight(38)
         self.setMaximumHeight(40)
         self._recalc_width()
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
 
     def set_label_text(self, text: str) -> None:
         self.setText(text)
         self._recalc_width()
         self.update()
+        self.updateGeometry()
 
     def _recalc_width(self) -> None:
         self.setFont(make_ui_font(9, QFont.Weight.Bold))
@@ -455,6 +460,13 @@ class ActionPillButton(QPushButton):
         painter.setPen(fg)
         painter.setFont(self.font())
         painter.drawText(txt_rect, Qt.AlignmentFlag.AlignCenter, self.text())
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
+
+    def sizeHint(self) -> QSize:
+        base = super().sizeHint()
+        return QSize(max(base.width(), _compute_safe_pill_min_width(self)), max(base.height(), 36))
 
 
 class NavRailButton(QAbstractButton):
@@ -905,6 +917,7 @@ class NeuHeroStageBackdrop(QWidget):
         self._tgt_c2 = QColor(c2)
         self._tgt_c3 = QColor(c3)
         self._wave_t = 0.0
+        self._orbs: list[dict] = []
 
     def set_palette_theme(self, palette: ThemePalette) -> None:
         self._palette = palette
@@ -918,12 +931,198 @@ class NeuHeroStageBackdrop(QWidget):
         self._tgt_c1, self._tgt_c2, self._tgt_c3 = get_flag_neon_triad(norm_c or "GLOBAL")
         self._phase = str(phase or "IDLE").upper()
 
+    def _spawn_orb(self, w: float, h: float, from_bottom: bool = False) -> dict:
+        base_r = random.uniform(9.5, 16.5)
+        pad_x = 34.0
+        x = random.uniform(pad_x, max(pad_x + 20.0, w - pad_x))
+        y = (h - 24.0) if from_bottom else random.uniform(34.0, max(54.0, h - 42.0))
+        return {
+            "x": x,
+            "y": y,
+            "vx": random.uniform(-0.72, 0.72),
+            "vy": random.uniform(-1.15, -0.55) if from_bottom else random.uniform(-0.55, 0.55),
+            "base_r": base_r,
+            "r": 2.8 if from_bottom else base_r,
+            "max_r": base_r * random.uniform(1.75, 2.15),
+            "state": "REFORM" if from_bottom else "WANDER",
+            "timer": random.randint(95, 230),
+            "color_idx": random.randint(0, 2),
+            "ring_r": 0.0,
+            "ring_alpha": 0.0,
+            "droplets": [],
+            "wobble": random.uniform(0.0, math.pi * 2.0),
+        }
+
+    def _ensure_orbs(self, w: float, h: float) -> None:
+        if len(self._orbs) < 7 and w > 180.0 and h > 140.0:
+            while len(self._orbs) < 7:
+                self._orbs.append(self._spawn_orb(w, h, from_bottom=False))
+
+    def _step_orbs(self) -> None:
+        w, h = float(self.width()), float(self.height())
+        if w < 140.0 or h < 120.0:
+            return
+        self._ensure_orbs(w, h)
+
+        left_b, right_b = 26.0, w - 26.0
+        top_b, bot_b = 24.0, h - 22.0
+        speed_mult = 1.32 if self._phase == "CONNECTING" else (1.12 if self._phase == "CONNECTED" else 0.85)
+
+        for idx, orb in enumerate(self._orbs):
+            orb["wobble"] = (orb["wobble"] + 0.07) % (2.0 * math.pi)
+            st = orb["state"]
+
+            if st == "REFORM":
+                orb["r"] += (orb["base_r"] - orb["r"]) * 0.09
+                orb["y"] += orb["vy"] * speed_mult
+                orb["x"] += math.sin(orb["wobble"]) * 0.45
+                if orb["r"] >= orb["base_r"] * 0.94:
+                    orb["r"] = orb["base_r"]
+                    orb["state"] = "WANDER"
+                    orb["vy"] = random.uniform(-0.62, 0.62)
+                    orb["timer"] = random.randint(90, 220)
+
+            elif st == "WANDER":
+                orb["vx"] += random.uniform(-0.04, 0.04)
+                orb["vy"] += random.uniform(-0.04, 0.04)
+                orb["vx"] = max(-0.95, min(0.95, orb["vx"]))
+                orb["vy"] = max(-0.85, min(0.85, orb["vy"]))
+                orb["x"] += orb["vx"] * speed_mult
+                orb["y"] += orb["vy"] * speed_mult
+
+                r_cur = orb["r"]
+                if orb["x"] - r_cur < left_b:
+                    orb["x"] = left_b + r_cur
+                    orb["vx"] = abs(orb["vx"])
+                elif orb["x"] + r_cur > right_b:
+                    orb["x"] = right_b - r_cur
+                    orb["vx"] = -abs(orb["vx"])
+                if orb["y"] - r_cur < top_b:
+                    orb["y"] = top_b + r_cur
+                    orb["vy"] = abs(orb["vy"])
+                elif orb["y"] + r_cur > bot_b:
+                    orb["y"] = bot_b - r_cur
+                    orb["vy"] = -abs(orb["vy"])
+
+                orb["timer"] -= 1
+                if orb["timer"] <= 0:
+                    orb["state"] = "SWELL"
+
+            elif st == "SWELL":
+                orb["vx"] *= 0.94
+                orb["vy"] *= 0.94
+                orb["x"] += orb["vx"] + math.sin(orb["wobble"] * 2.2) * 0.25
+                orb["y"] += orb["vy"] - 0.10
+                orb["r"] += 0.22 * speed_mult
+                if orb["r"] >= orb["max_r"]:
+                    orb["state"] = "BURST_FALL"
+                    orb["ring_r"] = orb["r"] * 0.85
+                    orb["ring_alpha"] = 215.0
+                    drops = []
+                    n_drops = random.randint(6, 9)
+                    for d_i in range(n_drops):
+                        ang = (2.0 * math.pi * d_i / n_drops) + random.uniform(-0.28, 0.28)
+                        spd = random.uniform(1.6, 3.6)
+                        drops.append(
+                            {
+                                "x": orb["x"] + math.cos(ang) * (orb["r"] * 0.42),
+                                "y": orb["y"] + math.sin(ang) * (orb["r"] * 0.42),
+                                "vx": math.cos(ang) * spd,
+                                "vy": math.sin(ang) * spd - random.uniform(0.9, 2.0),
+                                "r": random.uniform(3.0, 5.8),
+                                "alpha": 235.0,
+                                "bounced": False,
+                            }
+                        )
+                    orb["droplets"] = drops
+
+            elif st == "BURST_FALL":
+                if orb["ring_alpha"] > 0.0:
+                    orb["ring_r"] += 1.65
+                    orb["ring_alpha"] = max(0.0, orb["ring_alpha"] - 10.5)
+
+                alive_drops = 0
+                avg_x = 0.0
+                for dr in orb["droplets"]:
+                    dr["vy"] += 0.22
+                    dr["vx"] *= 0.985
+                    dr["x"] += dr["vx"]
+                    dr["y"] += dr["vy"]
+                    if dr["x"] < left_b:
+                        dr["x"] = left_b
+                        dr["vx"] = abs(dr["vx"]) * 0.6
+                    elif dr["x"] > right_b:
+                        dr["x"] = right_b
+                        dr["vx"] = -abs(dr["vx"]) * 0.6
+
+                    if dr["y"] >= bot_b - dr["r"]:
+                        dr["y"] = bot_b - dr["r"]
+                        if not dr["bounced"]:
+                            dr["vy"] = -abs(dr["vy"]) * 0.36
+                            dr["bounced"] = True
+                        else:
+                            dr["vy"] = 0.0
+                            dr["vx"] *= 0.82
+                            dr["alpha"] = max(0.0, dr["alpha"] - 11.0)
+                    else:
+                        dr["alpha"] = max(0.0, dr["alpha"] - 1.2)
+
+                    if dr["alpha"] > 4.0:
+                        alive_drops += 1
+                        avg_x += dr["x"]
+
+                if alive_drops == 0 and orb["ring_alpha"] <= 1.0:
+                    re_x = max(left_b + 16.0, min(right_b - 16.0, orb["x"] + random.uniform(-45.0, 45.0)))
+                    new_orb = self._spawn_orb(w, h, from_bottom=True)
+                    new_orb["x"] = re_x
+                    new_orb["y"] = bot_b - 6.0
+                    self._orbs[idx] = new_orb
+
+    def _draw_neu_sphere(self, painter: QPainter, cx: float, cy: float, r: float, tint: QColor, alpha_scale: float = 1.0, swell_ratio: float = 0.0) -> None:
+        if r < 1.5 or alpha_scale <= 0.02:
+            return
+        painter.save()
+        painter.setOpacity(max(0.0, min(1.0, alpha_scale)))
+
+        sh_d = parse_css_color(self._palette.neu_shadow_dark)
+        sh_d.setAlpha(int((118 if self._palette.is_dark else 88) * alpha_scale))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(sh_d)
+        painter.drawEllipse(QPointF(cx + r * 0.24, cy + r * 0.26), r * 1.02, r * 1.02)
+
+        sh_l = parse_css_color(self._palette.neu_shadow_light)
+        sh_l.setAlpha(int((55 if self._palette.is_dark else 135) * alpha_scale))
+        painter.setBrush(sh_l)
+        painter.drawEllipse(QPointF(cx - r * 0.20, cy - r * 0.20), r * 0.96, r * 0.96)
+
+        hi = _lerp_color(parse_css_color(self._palette.surface_hi), tint, 0.22 + 0.26 * swell_ratio)
+        mid = _lerp_color(parse_css_color(self._palette.card_bg), tint, 0.14 + 0.20 * swell_ratio)
+        lo = _lerp_color(parse_css_color(self._palette.surface_lo), tint, 0.08)
+
+        grad = QRadialGradient(QPointF(cx - r * 0.32, cy - r * 0.32), r * 1.45)
+        grad.setColorAt(0.0, hi.lighter(118 if self._palette.is_dark else 106))
+        grad.setColorAt(0.55, mid)
+        grad.setColorAt(1.0, lo)
+
+        rim = QColor(tint)
+        rim.setAlpha(int((78 + 115 * swell_ratio) * alpha_scale))
+        painter.setBrush(grad)
+        painter.setPen(QPen(rim, 1.0 + 0.7 * swell_ratio))
+        painter.drawEllipse(QPointF(cx, cy), r, r)
+
+        spec_c = QColor(255, 255, 255, int((115 if self._palette.is_dark else 175) * alpha_scale))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(spec_c)
+        painter.drawEllipse(QPointF(cx - r * 0.32, cy - r * 0.32), max(1.1, r * 0.22), max(1.1, r * 0.17))
+        painter.restore()
+
     def advance_frame(self) -> None:
         mult = 2.0 if self._phase == "CONNECTING" else (1.35 if self._phase == "CONNECTED" else 0.65)
         self._wave_t = (self._wave_t + 0.032 * mult) % (2.0 * math.pi * 20.0)
         self._cur_c1 = _lerp_color(self._cur_c1, self._tgt_c1, 0.10)
         self._cur_c2 = _lerp_color(self._cur_c2, self._tgt_c2, 0.10)
         self._cur_c3 = _lerp_color(self._cur_c3, self._tgt_c3, 0.10)
+        self._step_orbs()
         self.update()
 
     def paintEvent(self, _event) -> None:
@@ -959,34 +1158,90 @@ class NeuHeroStageBackdrop(QWidget):
 
         rtl = I18N.is_rtl()
         dest_x = card.left() + card.width() * 0.24 if rtl else card.right() - card.width() * 0.24
-        aura = QRadialGradient(QPointF(dest_x, card.top() + card.height() * 0.42), card.width() * 0.45)
+        aura = QRadialGradient(QPointF(dest_x, card.top() + card.height() * 0.42), card.width() * 0.48)
         aura_c = QColor(self._cur_c1 if self._phase == "CONNECTED" else ambient_tint)
-        aura_c.setAlpha(38 if self._palette.is_dark else 26)
+        aura_c.setAlpha(44 if self._palette.is_dark else 30)
         aura.setColorAt(0.0, aura_c)
-        aura.setColorAt(0.6, QColor(self._cur_c3.red(), self._cur_c3.green(), self._cur_c3.blue(), 14))
+        aura.setColorAt(0.6, QColor(self._cur_c3.red(), self._cur_c3.green(), self._cur_c3.blue(), 18))
         aura.setColorAt(1.0, QColor(aura_c.red(), aura_c.green(), aura_c.blue(), 0))
         painter.setBrush(aura)
         painter.drawRect(card)
 
-        if self._phase == "CONNECTED" and self._country_code:
+        # Prominent & Larger Neumorphic Flag Showcase Box behind HeroCard
+        if self._country_code:
             painter.save()
-            wm_w, wm_h = 235.0, 148.0
-            wm_cx = card.left() + 175.0 if rtl else card.right() - 175.0
-            wm_cy = card.top() + card.height() * 0.39 + math.sin(self._wave_t * 0.6) * 4.0
+            wm_w = min(350.0, max(250.0, card.width() * 0.36))
+            wm_h = wm_w * 0.62
+            wm_cx = (card.left() + wm_w * 0.56 + 18.0) if rtl else (card.right() - wm_w * 0.56 - 18.0)
+            wm_cy = card.top() + card.height() * 0.42 + math.sin(self._wave_t * 0.55) * 4.5
             painter.translate(wm_cx, wm_cy)
-            painter.rotate(-8.5 if rtl else 8.5)
+            painter.rotate(-5.0 if rtl else 5.0)
+
+            frame_rect = QRectF(-wm_w / 2.0 - 10.0, -wm_h / 2.0 - 10.0, wm_w + 20.0, wm_h + 20.0)
+            flag_rect = QRectF(-wm_w / 2.0, -wm_h / 2.0, wm_w, wm_h)
+
+            is_conn = self._phase == "CONNECTED"
+            box_opacity = 0.85 if is_conn else 0.45
+            painter.setOpacity(box_opacity)
+            draw_neu_inset(
+                painter,
+                frame_rect,
+                22.0,
+                self._palette,
+                depth=5.0,
+                glow_tint=self._cur_c1 if is_conn else None,
+            )
+
+            flag_op = (0.36 if self._palette.is_dark else 0.28) if is_conn else (0.14 if self._palette.is_dark else 0.11)
             VectorFlagRenderer.draw_flag(
                 painter,
                 self._country_code,
-                QRectF(-wm_w / 2.0, -wm_h / 2.0, wm_w, wm_h),
-                radius=16.0,
-                opacity=0.14 if self._palette.is_dark else 0.10,
-                with_border=False,
+                flag_rect,
+                radius=15.0,
+                opacity=flag_op,
+                with_border=True,
             )
+
+            rim_col = QColor(self._cur_c1)
+            rim_col.setAlpha(110 if is_conn else 45)
+            painter.setOpacity(1.0)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setPen(QPen(rim_col, 1.4))
+            painter.drawRoundedRect(frame_rect, 22.0, 22.0)
             painter.restore()
             painter.setClipPath(clip)
 
+        # Neumorphic Floating, Swelling, Bursting & Cascading Orbs
         triad = (self._cur_c1, self._cur_c2, self._cur_c3)
+        for orb in self._orbs:
+            o_col = triad[orb["color_idx"] % 3]
+            st = orb["state"]
+            if st in ("WANDER", "REFORM", "SWELL"):
+                swell_r = 0.0
+                if st == "SWELL":
+                    span = max(1.0, orb["max_r"] - orb["base_r"])
+                    swell_r = max(0.0, min(1.0, (orb["r"] - orb["base_r"]) / span))
+                alpha_sc = min(1.0, orb["r"] / max(1.0, orb["base_r"])) if st == "REFORM" else 0.88
+                self._draw_neu_sphere(painter, orb["x"], orb["y"], orb["r"], o_col, alpha_scale=alpha_sc, swell_ratio=swell_r)
+            elif st == "BURST_FALL":
+                if orb["ring_alpha"] > 2.0:
+                    rc = QColor(o_col)
+                    rc.setAlpha(int(orb["ring_alpha"]))
+                    painter.setBrush(Qt.BrushStyle.NoBrush)
+                    painter.setPen(QPen(rc, 2.0))
+                    painter.drawEllipse(QPointF(orb["x"], orb["y"]), orb["ring_r"], orb["ring_r"])
+                for dr in orb["droplets"]:
+                    if dr["alpha"] > 4.0:
+                        self._draw_neu_sphere(
+                            painter,
+                            dr["x"],
+                            dr["y"],
+                            dr["r"],
+                            o_col,
+                            alpha_scale=(dr["alpha"] / 255.0),
+                            swell_ratio=0.5,
+                        )
+
         for idx, w_col in enumerate(triad):
             ribbon = QPainterPath()
             base_y = card.bottom() - (26.0 + idx * 17.0)
@@ -1188,8 +1443,8 @@ class AnimatedRadarCore(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumSize(208, 208)
-        self.setMaximumSize(232, 232)
+        self.setMinimumSize(224, 224)
+        self.setMaximumSize(248, 248)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -1205,6 +1460,11 @@ class AnimatedRadarCore(QWidget):
         self._tgt_c1 = QColor(c1)
         self._tgt_c2 = QColor(c2)
         self._tgt_c3 = QColor(c3)
+
+        self._rx_kbps = 0.0
+        self._tx_kbps = 0.0
+        self._bubbles: list[dict] = []
+        self._bubble_tick = 0
 
         self._angle = 0.0
         self._pulse = 0.0
@@ -1227,7 +1487,7 @@ class AnimatedRadarCore(QWidget):
         QTimer.singleShot(0, self._ensure_hero_stage_attached)
 
     def sizeHint(self) -> QSize:
-        return QSize(216, 216)
+        return QSize(232, 232)
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
@@ -1281,12 +1541,68 @@ class AnimatedRadarCore(QWidget):
 
         self._sync_stage_companions()
 
+    def _distinct_flag_pair(self) -> tuple[QColor, QColor]:
+        c1, c2, c3 = self._flag_c1, self._flag_c2, self._flag_c3
+        d12 = abs(c1.red() - c2.red()) + abs(c1.green() - c2.green()) + abs(c1.blue() - c2.blue())
+        d13 = abs(c1.red() - c3.red()) + abs(c1.green() - c3.green()) + abs(c1.blue() - c3.blue())
+        return (c1, c2) if (d12 >= d13) else (c1, c3)
+
+    def _step_traffic_bubbles(self) -> None:
+        is_conn = self._phase == "CONNECTED"
+        has_dl = is_conn and (self._rx_kbps > 0.05)
+        has_ul = is_conn and (self._tx_kbps > 0.05)
+
+        # State 1: Zero DL & UL -> No bubbles emitted (existing ones fade cleanly)
+        # State 2: Single direction active (DL or UL only) -> Single flag color
+        # State 3: Both DL & UL active -> Simultaneous two-color flag mix
+        self._bubble_tick += 1
+        if has_dl or has_ul:
+            col_dl, col_ul = self._distinct_flag_pair()
+            both_active = has_dl and has_ul
+            spawn_every = 2 if both_active else 3
+
+            if (self._bubble_tick % spawn_every) == 0 and len(self._bubbles) < 34:
+                burst_n = 2 if both_active else 1
+                for b_i in range(burst_n):
+                    is_micro = random.random() < 0.56
+                    if both_active:
+                        col = QColor(col_dl if ((self._bubble_tick + b_i) % 2 == 0) else col_ul)
+                    else:
+                        col = QColor(col_dl if has_dl else col_ul)
+
+                    ang = random.uniform(0.0, 2.0 * math.pi)
+                    self._bubbles.append(
+                        {
+                            "angle": ang,
+                            "dist": random.uniform(0.0, 3.0),
+                            "speed": random.uniform(0.45, 0.95) if not is_micro else random.uniform(0.60, 1.18),
+                            "drift": random.uniform(-0.025, 0.025),
+                            "r": random.uniform(1.4, 2.6) if is_micro else random.uniform(3.2, 5.6),
+                            "life": 1.0,
+                            "decay": random.uniform(0.022, 0.038),
+                            "color": col,
+                            "micro": is_micro,
+                        }
+                    )
+
+        next_bubbles: list[dict] = []
+        fade_boost = 2.4 if (not has_dl and not has_ul) else 1.0
+        for b in self._bubbles:
+            b["dist"] += b["speed"]
+            b["angle"] += b["drift"]
+            b["life"] -= b["decay"] * fade_boost
+            if b["life"] > 0.02 and b["dist"] < 21.0:
+                next_bubbles.append(b)
+        self._bubbles = next_bubbles
+
     def _resolve_live_meta(self) -> tuple[str, str, str, int, float]:
         code = self._country_code if self._phase == "CONNECTED" else ""
         proto = "VLESS"
         vec = "AUTO"
         ping = 0
         boost = 0.0
+        rx = 0.0
+        tx = 0.0
 
         hero = self.parentWidget()
         home = hero.parentWidget() if hero is not None else None
@@ -1309,6 +1625,8 @@ class AnimatedRadarCore(QWidget):
                     if vec == "AUTO":
                         vec = str(cur_out.get("vector_id") or cur_out.get("cached_vector_id") or vec)
 
+        self._rx_kbps = rx if self._phase == "CONNECTED" else 0.0
+        self._tx_kbps = tx if self._phase == "CONNECTED" else 0.0
         return code, proto, vec, ping, boost
 
     def _sync_stage_companions(self) -> None:
@@ -1364,6 +1682,9 @@ class AnimatedRadarCore(QWidget):
         if norm == self._phase:
             return
         self._phase = norm
+        if norm != "CONNECTED":
+            self._rx_kbps = 0.0
+            self._tx_kbps = 0.0
         target = 0.98 if norm == "CONNECTED" else (0.88 if norm == "CONNECTING" else 0.36)
         self._glow_anim.stop()
         self._glow_anim.setStartValue(self._glow)
@@ -1387,6 +1708,7 @@ class AnimatedRadarCore(QWidget):
         self._flag_c3 = _lerp_color(self._flag_c3, self._tgt_c3, 0.12)
 
         self._sync_stage_companions()
+        self._step_traffic_bubbles()
         self.update()
 
     def mouseReleaseEvent(self, event) -> None:
@@ -1399,7 +1721,7 @@ class AnimatedRadarCore(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
         cx, cy = self.width() / 2.0, self.height() / 2.0
-        max_r = min(cx, cy) - 9.0
+        max_r = min(cx, cy) - 21.0
         breath = 0.5 + 0.5 * math.sin(self._pulse)
 
         emerald = QColor("#10B981")
@@ -1418,6 +1740,34 @@ class AnimatedRadarCore(QWidget):
         else:
             core_col = QColor(self._palette.accent_primary)
             orbit_col = self._flag_c2
+
+        # 3-State Neumorphic Bubbles & Micro-Bubbles radiating around the dial
+        for b in self._bubbles:
+            life = max(0.0, min(1.0, b["life"]))
+            rad_dist = max_r + 1.5 + b["dist"]
+            bx = cx + math.cos(b["angle"]) * rad_dist
+            by = cy + math.sin(b["angle"]) * rad_dist
+            br = b["r"] * (0.75 + 0.25 * math.sin(life * math.pi))
+            bc = QColor(b["color"])
+
+            sh_c = parse_css_color(self._palette.neu_shadow_dark)
+            sh_c.setAlpha(int(95 * life))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(sh_c)
+            painter.drawEllipse(QPointF(bx + 1.0, by + 1.2), br, br)
+
+            fill_c = QColor(bc)
+            fill_c.setAlpha(int((145 if b["micro"] else 105) * life))
+            rim_c = QColor(bc)
+            rim_c.setAlpha(int(235 * life))
+            painter.setBrush(fill_c)
+            painter.setPen(QPen(rim_c, 0.9 if b["micro"] else 1.25))
+            painter.drawEllipse(QPointF(bx, by), br, br)
+
+            if not b["micro"]:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(255, 255, 255, int(185 * life)))
+                painter.drawEllipse(QPointF(bx - br * 0.32, by - br * 0.32), max(0.8, br * 0.24), max(0.8, br * 0.24))
 
         outer_dial = QRectF(cx - max_r, cy - max_r, max_r * 2.0, max_r * 2.0)
         draw_neu_raised(painter, outer_dial, max_r, self._palette, depth=6.0, accent_tint=core_col)
@@ -2082,3 +2432,193 @@ class LiveSparklineWidget(QWidget):
             painter.drawEllipse(tip, 2.1, 2.1)
 
         painter.restore()
+
+def _compute_safe_pill_min_width(btn) -> int:
+    lbl = getattr(btn, "_label", None) or getattr(btn, "_text_lbl", None) or getattr(btn, "lbl", None)
+    if lbl is not None and hasattr(lbl, "text"):
+        txt = str(lbl.text() or "")
+        fm = lbl.fontMetrics()
+    else:
+        txt = str(getattr(btn, "_text", "") or btn.text() or "")
+        fm = btn.fontMetrics()
+    if not txt:
+        return 44
+    has_icon = bool(getattr(btn, "_icon_name", "") or (hasattr(btn, "icon") and not btn.icon().isNull()))
+    pad = 58 if has_icon else 34
+    return int(fm.horizontalAdvance(txt) + pad)
+
+
+class JustifiedFlowLayout(QLayout):
+    """
+    Responsive RTL/LTR-aware flow layout that justifies button rows cleanly across
+    the full available width and wraps gracefully without ever squishing or clipping buttons.
+    """
+
+    def __init__(self, parent=None, h_spacing: int = 8, v_spacing: int = 8, justify: bool = True):
+        super().__init__(parent)
+        self._items: list = []
+        self._h_spacing = int(h_spacing)
+        self._v_spacing = int(v_spacing)
+        self._justify = bool(justify)
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item) -> None:
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items[index]
+        return None
+
+    def takeAt(self, index: int):
+        if 0 <= index < len(self._items):
+            return self._items.pop(index)
+        return None
+
+    def expandingDirections(self) -> Qt.Orientation:
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:
+        return True
+
+    def heightForWidth(self, width: int) -> int:
+        return self._do_layout(QRect(0, 0, max(1, int(width)), 0), test_only=True)
+
+    def setGeometry(self, rect: QRect) -> None:
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self) -> QSize:
+        m = self.contentsMargins()
+        w_sum = 0
+        h_max = 0
+        vis = 0
+        for item in self._items:
+            wdg = item.widget()
+            if wdg is not None and wdg.isHidden():
+                continue
+            if wdg is None and item.spacerItem() is not None:
+                continue
+            sz = item.sizeHint()
+            ms = item.minimumSize()
+            iw = max(sz.width(), ms.width())
+            ih = max(sz.height(), ms.height())
+            w_sum += iw + (self._h_spacing if vis > 0 else 0)
+            h_max = max(h_max, ih)
+            vis += 1
+        return QSize(w_sum + m.left() + m.right(), h_max + m.top() + m.bottom())
+
+    def minimumSize(self) -> QSize:
+        m = self.contentsMargins()
+        max_w = 0
+        max_h = 0
+        for item in self._items:
+            wdg = item.widget()
+            if wdg is not None and wdg.isHidden():
+                continue
+            if wdg is None and item.spacerItem() is not None:
+                continue
+            sz = item.minimumSize()
+            sh = item.sizeHint()
+            max_w = max(max_w, min(sz.width(), sh.width()) if sz.width() > 0 else sh.width())
+            max_h = max(max_h, max(sz.height(), sh.height()))
+        return QSize(max_w + m.left() + m.right(), max_h + m.top() + m.bottom())
+
+    def _do_layout(self, rect: QRect, test_only: bool) -> int:
+        m = self.contentsMargins()
+        eff = rect.adjusted(m.left(), m.top(), -m.right(), -m.bottom())
+        avail_w = max(1, eff.width())
+        h_sp = self._h_spacing
+        v_sp = self._v_spacing
+
+        visible_items = []
+        for item in self._items:
+            wdg = item.widget()
+            if wdg is not None and wdg.isHidden():
+                continue
+            if wdg is None and item.spacerItem() is not None:
+                continue
+            sz = item.sizeHint()
+            ms = item.minimumSize()
+            iw = max(sz.width(), ms.width())
+            ih = max(sz.height(), ms.height())
+            visible_items.append((item, wdg, iw, ih))
+
+        if not visible_items:
+            return m.top() + m.bottom()
+
+        rows = []
+        cur_row = []
+        cur_w = 0
+        for entry in visible_items:
+            iw = entry[2]
+            needed = iw if not cur_row else (cur_w + h_sp + iw)
+            if cur_row and needed > avail_w:
+                rows.append(cur_row)
+                cur_row = [entry]
+                cur_w = iw
+            else:
+                cur_row.append(entry)
+                cur_w = needed
+        if cur_row:
+            rows.append(cur_row)
+
+        parent_w = self.parentWidget()
+        if parent_w is not None:
+            is_rtl = parent_w.layoutDirection() == Qt.LayoutDirection.RightToLeft
+        else:
+            is_rtl = I18N.is_rtl()
+
+        y = eff.y()
+        for r_idx, row in enumerate(rows):
+            row_h = max(e[3] for e in row)
+            if not test_only:
+                base_total = sum(e[2] for e in row) + h_sp * max(0, len(row) - 1)
+                slack = avail_w - base_total
+                widths = [e[2] for e in row]
+
+                if self._justify and slack > 0 and len(row) >= 2:
+                    exp_idx = [
+                        i
+                        for i, e in enumerate(row)
+                        if e[1] is not None
+                        and isinstance(e[1], QAbstractButton)
+                        and (not isinstance(e[1], QCheckBox))
+                    ]
+                    if not exp_idx:
+                        exp_idx = list(range(len(row)))
+
+                    per_item = slack / len(exp_idx)
+                    is_sparse_tail = (len(rows) > 1) and (r_idx == len(rows) - 1) and (len(row) <= 2)
+                    max_cap = 45.0 if is_sparse_tail else 140.0
+
+                    if per_item <= max_cap:
+                        add_int = int(slack // len(exp_idx))
+                        rem = int(slack - add_int * len(exp_idx))
+                        for k_i, idx_e in enumerate(exp_idx):
+                            widths[idx_e] += add_int + (1 if k_i < rem else 0)
+                    else:
+                        bonus = int(min(36.0, max_cap))
+                        for idx_e in exp_idx:
+                            widths[idx_e] += bonus
+
+                if is_rtl:
+                    x = eff.x() + eff.width()
+                    for (item, _wdg, _iw, ih), final_w in zip(row, widths):
+                        x -= final_w
+                        iy = y + (row_h - ih) // 2
+                        item.setGeometry(QRect(x, iy, final_w, ih))
+                        x -= h_sp
+                else:
+                    x = eff.x()
+                    for (item, _wdg, _iw, ih), final_w in zip(row, widths):
+                        iy = y + (row_h - ih) // 2
+                        item.setGeometry(QRect(x, iy, final_w, ih))
+                        x += final_w + h_sp
+
+            y += row_h + v_sp
+
+        return max(0, (y - v_sp) - eff.y() + m.top() + m.bottom())

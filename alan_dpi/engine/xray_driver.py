@@ -1,3 +1,6 @@
+import threading
+import zlib
+import hashlib
 import random
 import base64
 import concurrent.futures
@@ -69,27 +72,306 @@ def find_free_tcp_port(preferred: int = 0) -> int:
         s2.close()
 
 
-class UriConfigCodec:
-    SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "socks://")
 
-    @classmethod
-    def extract_uris_from_blob(cls, text: str) -> List[str]:
-        raw = (text or "").strip()
-        if not raw:
-            return []
-        if "://" not in raw:
+def _parse_socks_uri_components(uri: str):
+    raw = (uri or "").strip()
+    remark = ""
+    if "#" in raw:
+        raw, frag = raw.split("#", 1)
+        remark = urllib.parse.unquote(frag).strip()
+
+    body = raw.split("://", 1)[1] if "://" in raw else raw
+    body = body.split("?", 1)[0].strip().rstrip("/")
+
+    user = ""
+    pwd = ""
+    host = ""
+    port = 1080
+
+    if "@" not in body:
+        try:
+            pad = (-len(body)) % 4
+            dec = base64.b64decode(body + ("=" * pad)).decode("utf-8", errors="ignore").strip()
+            if ":" in dec and ("@" in dec or dec.count(":") == 1):
+                body = dec
+        except Exception:
+            pass
+
+    if "@" in body:
+        auth_part, host_part = body.rsplit("@", 1)
+        if ":" not in auth_part:
             try:
-                decoded = _b64_decode_padded(raw)
-                if "://" in decoded:
-                    raw = decoded
+                pad = (-len(auth_part)) % 4
+                dec_a = base64.b64decode(auth_part + ("=" * pad)).decode("utf-8", errors="ignore")
+                if ":" in dec_a:
+                    auth_part = dec_a
             except Exception:
                 pass
-        results: List[str] = []
-        for line in raw.splitlines():
-            item = line.strip()
-            if any(item.lower().startswith(sch) for sch in cls.SUPPORTED_SCHEMES):
-                results.append(item)
-        return results
+        if ":" in auth_part:
+            u_raw, p_raw = auth_part.split(":", 1)
+            user = urllib.parse.unquote(u_raw)
+            pwd = urllib.parse.unquote(p_raw)
+        else:
+            user = urllib.parse.unquote(auth_part)
+    else:
+        host_part = body
+
+    host_part = host_part.strip()
+    if host_part.startswith("[") and "]:" in host_part:
+        h_s, p_s = host_part[1:].split("]:", 1)
+        host = h_s.strip()
+        port = int(p_s.strip()) if p_s.strip().isdigit() else 1080
+    elif ":" in host_part:
+        h_s, p_s = host_part.rsplit(":", 1)
+        host = h_s.strip("[]")
+        port = int(p_s.strip()) if p_s.strip().isdigit() else 1080
+    else:
+        host = host_part.strip("[]")
+
+    name = remark or f"SOCKS5-{host}:{port}"
+    return host, port, user, pwd, name
+
+
+def _parse_socks_to_editable(uri: str, uid: str = "", group_tag: str = "Manual", preferred_vec: str = "AUTO") -> dict:
+    host, port, user, pwd, name = _parse_socks_uri_components(uri)
+    cred = f"{user}:{pwd}" if (user or pwd) else ""
+    return {
+        "uid": uid,
+        "group": group_tag or "Manual",
+        "group_tag": group_tag or "Manual",
+        "name": name,
+        "protocol": "socks",
+        "address": host,
+        "host": host,
+        "port": int(port),
+        "uuid_or_password": cred,
+        "username": user,
+        "password": pwd,
+        "network": "tcp",
+        "security": "none",
+        "sni": "",
+        "host_header": "",
+        "path": "",
+        "alpn": "",
+        "fingerprint": "",
+        "public_key": "",
+        "short_id": "",
+        "preferred_vector_id": preferred_vec or "VEC-00",
+        "raw_uri": uri.strip(),
+        "uri": uri.strip(),
+        "use_raw_uri": False,
+    }
+
+
+def _build_socks_uri(data: dict) -> str:
+    host = str(data.get("address") or data.get("host") or "127.0.0.1").strip()
+    port = int(data.get("port") or 1080)
+    name = str(data.get("name") or f"SOCKS5-{host}:{port}").strip()
+    cred = str(data.get("uuid_or_password") or "").strip()
+    user = str(data.get("username") or "").strip()
+    pwd = str(data.get("password") or "").strip()
+    if cred and not (user or pwd):
+        if ":" in cred:
+            user, pwd = cred.split(":", 1)
+        else:
+            user = cred
+    frag = urllib.parse.quote(name)
+    if user or pwd:
+        b64_auth = base64.b64encode(f"{user}:{pwd}".encode("utf-8")).decode("ascii")
+        return f"socks://{b64_auth}@{host}:{port}#{frag}"
+    return f"socks://{host}:{port}#{frag}"
+
+
+def _build_socks_xray_outbound(uri: str, target_host: str, target_port: int, tag: str = "proxy") -> dict:
+    _h, _p, user, pwd, _n = _parse_socks_uri_components(uri)
+    srv = {"address": str(target_host), "port": int(target_port)}
+    if user or pwd:
+        srv["users"] = [{"user": user, "pass": pwd}]
+    return {
+        "tag": tag,
+        "protocol": "socks",
+        "settings": {"servers": [srv]},
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+_V2RAY_SCHEMES = (
+    "vless://",
+    "vmess://",
+    "trojan://",
+    "ss://",
+    "ssr://",
+    "socks://",
+    "socks5://",
+    "socks4://",
+    "hysteria2://",
+    "hy2://",
+    "tuic://",
+)
+
+_V2RAY_URI_RE = re.compile(
+    r"(?i)\b(?:vless|vmess|trojan|ss|ssr|socks5|socks4|socks|hysteria2|hy2|tuic)://[^\s\"'<>`]+"
+)
+
+
+def _decode_b64_v2ray(text: str) -> str:
+    raw = (text or "").strip().lstrip("\ufeff")
+    if not raw or len(raw) < 12:
+        return ""
+    compact = re.sub(r"\s+", "", raw)
+    if "://" in compact:
+        return ""
+    std = compact.replace("-", "+").replace("_", "/")
+    if not re.fullmatch(r"[A-Za-z0-9+/=]+", std):
+        return ""
+    try:
+        pad = (-len(std)) % 4
+        decoded = base64.b64decode(std + ("=" * pad)).decode("utf-8", errors="strict")
+        if any(s in decoded.lower() for s in _V2RAY_SCHEMES):
+            return decoded
+    except Exception:
+        pass
+    return ""
+
+
+def _build_socks_profile_node(uri: str, group_tag: str = "Manual", is_hidden: bool = False, explicit_country: str = ""):
+    from alan_dpi.engine.models import LocationExtractor, ProfileNode
+    clean_uri = (uri or "").strip()
+    ed = _parse_socks_to_editable(clean_uri, group_tag=group_tag)
+    uid = hashlib.sha1(f"{clean_uri}|{group_tag}".encode("utf-8", errors="ignore")).hexdigest()[:16]
+    cc = (explicit_country or "").strip().upper() or LocationExtractor.extract_country_code(name=ed.get("name", ""), uri=clean_uri)
+    nd = ProfileNode.from_dict({
+        "uid": uid,
+        "name": ed.get("name") or f"SOCKS5-{ed.get('host', '')}:{ed.get('port', 1080)}",
+        "protocol": "SOCKS5",
+        "uri": clean_uri,
+        "original_host": str(ed.get("host") or ""),
+        "port": int(ed.get("port") or 1080),
+        "sni": "",
+        "group_tag": group_tag or "Manual",
+        "is_hidden_pool": bool(is_hidden),
+        "country_code": cc,
+        "cached_vector_id": "VEC-00",
+        "cached_clean_ip": "",
+        "health_status": "UNTESTED",
+    })
+    nd.group_tag = group_tag or "Manual"
+    nd.is_hidden_pool = bool(is_hidden)
+    nd.country_code = cc
+    nd.original_host = str(ed.get("host") or "")
+    nd.port = int(ed.get("port") or 1080)
+    return nd
+
+
+def _build_standalone_socks_xray_config(uri: str, socks_port: int, http_port: int, target_host: str, target_port: int) -> dict:
+    proxy_out = _build_socks_xray_outbound(uri, target_host=target_host, target_port=target_port, tag="proxy")
+    return {
+        "log": {"loglevel": "warning"},
+        "dns": {"servers": ["1.1.1.1", "8.8.8.8"], "queryStrategy": "UseIPv4"},
+        "inbounds": [
+            {
+                "tag": "socks-in",
+                "listen": "127.0.0.1",
+                "port": int(socks_port),
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+            },
+            {
+                "tag": "http-in",
+                "listen": "127.0.0.1",
+                "port": int(http_port),
+                "protocol": "http",
+                "settings": {"allowTransparent": False},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls"], "routeOnly": False},
+            },
+        ],
+        "outbounds": [
+            proxy_out,
+            {"tag": "direct", "protocol": "freedom", "settings": {}},
+            {"tag": "block", "protocol": "blackhole", "settings": {}},
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+            "rules": [{"type": "field", "inboundTag": ["socks-in", "http-in"], "outboundTag": "proxy"}],
+        },
+    }
+
+
+class UriConfigCodec:
+    SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://", "socks4://", "hysteria2://", "hy2://", "tuic://")
+
+    @classmethod
+    def extract_uris_from_blob(cls, blob: str, default_name: str = "") -> List[str]:
+        raw = (blob or "").strip().lstrip("\ufeff")
+        if not raw:
+            return []
+
+        texts_to_scan: List[str] = [raw]
+        cur = raw
+        for _ in range(2):
+            dec = _decode_b64_v2ray(cur)
+            if dec and dec not in texts_to_scan:
+                texts_to_scan.append(dec)
+                cur = dec
+            else:
+                break
+
+        found: List[str] = []
+        seen = set()
+
+        def _push(u: str):
+            cu = (u or "").strip().rstrip(".,;)")
+            if cu and (cu not in seen):
+                seen.add(cu)
+                found.append(cu)
+
+        for text in texts_to_scan:
+            for m in _V2RAY_URI_RE.finditer(text):
+                _push(m.group(0))
+
+            for raw_ln in text.splitlines():
+                ln = raw_ln.strip()
+                if not ln or "://" in ln or len(ln) < 16:
+                    continue
+                dec_ln = _decode_b64_v2ray(ln)
+                if dec_ln:
+                    for m2 in _V2RAY_URI_RE.finditer(dec_ln):
+                        _push(m2.group(0))
+        return found
+
+
 
     @classmethod
     def parse_editable_fields(cls, node: ProfileNode) -> dict:
@@ -105,6 +387,8 @@ class UriConfigCodec:
 
     @classmethod
     def parse_to_editable(cls, uri: str, uid: str = "", group_tag: str = "Manual", preferred_vec: str = "AUTO") -> dict:
+        if str(uri or "").strip().lower().startswith(("socks://", "socks5://", "socks4://")):
+            return _parse_socks_to_editable(uri, uid=uid, group_tag=group_tag, preferred_vec=preferred_vec)
         clean_uri = (uri or "").strip()
         lower = clean_uri.lower()
         base = {
@@ -232,6 +516,8 @@ class UriConfigCodec:
 
     @classmethod
     def build_uri_from_editable(cls, fields: dict, inject_early_data: int = 0) -> str:
+        if str(fields.get("protocol") or "").strip().lower() in ("socks", "socks5", "socks4"):
+            return _build_socks_uri(fields)
         if fields.get("use_raw_uri") and fields.get("raw_uri"):
             return str(fields["raw_uri"]).strip()
 
@@ -322,13 +608,17 @@ class UriConfigCodec:
         is_hidden: bool = False,
         explicit_country: str = "",
     ) -> ProfileNode:
+        if str(uri or "").strip().lower().startswith(("socks://", "socks5://", "socks4://")):
+            return _build_socks_profile_node(uri, group_tag=group_tag, is_hidden=is_hidden, explicit_country=explicit_country)
         ed = cls.parse_to_editable(uri, group_tag=group_tag)
         proto_map = {
             "vless": "VLESS",
             "vmess": "VMess",
             "trojan": "Trojan",
             "ss": "Shadowsocks",
-            "socks": "SOCKS",
+            "socks": "SOCKS5",
+            "socks5": "SOCKS5",
+            "socks4": "SOCKS5",
         }
         proto_label = proto_map.get(ed["protocol"], ed["protocol"].upper())
         cc = LocationExtractor.extract_country_code(name=ed["name"], uri=uri, explicit_loc=explicit_country)
@@ -355,6 +645,8 @@ class UriConfigCodec:
         dialer_proxy: str = "",
         strip_allow_insecure: bool = False,
     ) -> dict:
+        if str(uri or "").strip().lower().startswith(("socks://", "socks5://", "socks4://")):
+            return _build_socks_xray_outbound(uri, target_host=target_host, target_port=target_port, tag=tag)
         ed = cls.parse_to_editable(uri)
         proto = ed["protocol"]
 
@@ -492,6 +784,81 @@ class UriConfigCodec:
 
 class XrayProcessDriver:
     _cached_major_ver: Optional[int] = None
+
+
+    def _stop_custom_proc_if_any(self):
+        proc = getattr(self, "_custom_wg_proc", None)
+        if proc is not None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            self._custom_wg_proc = None
+
+    def _start_custom_protocol_xray(
+        self,
+        uri: str,
+        settings,
+        direct_remote_host: str = "",
+        direct_remote_port: int = 0,
+    ) -> Tuple[int, int]:
+        self.stop()
+        self._stop_custom_proc_if_any()
+
+        socks_port = int(getattr(settings, "socks_port", 10808) or 10808)
+        http_port = int(getattr(settings, "http_port", 10809) or 10809)
+        s_host, s_port, _, _, _ = _parse_socks_uri_components(uri)
+        t_host = (direct_remote_host or s_host).strip()
+        t_port = int(direct_remote_port or s_port)
+
+        cfg = _build_standalone_socks_xray_config(
+            uri=uri,
+            socks_port=socks_port,
+            http_port=http_port,
+            target_host=t_host,
+            target_port=t_port,
+        )
+        cfg_path = os.path.join(self.configs_dir, f"xray_socks_{socks_port}.json")
+        with open(cfg_path, "w", encoding="utf-8") as fh:
+            json.dump(cfg, fh, indent=2, ensure_ascii=False)
+
+        xray_bin = os.path.join(self.core_dir, "xray.exe" if os.name == "nt" else "xray")
+        flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        proc = subprocess.Popen(
+            [xray_bin, "run", "-c", cfg_path],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            cwd=self.core_dir,
+            creationflags=flags,
+        )
+        self._custom_wg_proc = proc
+        self.active_socks_port = socks_port
+        self.active_http_port = http_port
+
+        deadline = time.perf_counter() + 2.5
+        while time.perf_counter() < deadline:
+            if proc.poll() is not None:
+                self._stop_custom_proc_if_any()
+                raise RuntimeError("Xray SOCKS5 start failed")
+            s_chk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s_chk.settimeout(0.25)
+            try:
+                s_chk.connect(("127.0.0.1", http_port))
+                break
+            except Exception:
+                time.sleep(0.1)
+            finally:
+                try:
+                    s_chk.close()
+                except Exception:
+                    pass
+        return socks_port, http_port
+
 
     def __init__(self, core_dir: str, configs_dir: str, log_fn=None):
         self.core_dir = core_dir
@@ -661,6 +1028,10 @@ class XrayProcessDriver:
         physical_nic_alias: str = "",
         is_probe_mode: bool = False,
     ) -> Tuple[int, int]:
+        if str(uri or "").strip().lower().startswith(("socks://", "socks5://", "socks4://")):
+            return self._start_custom_protocol_xray(uri=uri, settings=settings, direct_remote_host=str(direct_remote_host or ""), direct_remote_port=int(direct_remote_port or 0))
+        self._stop_custom_proc_if_any()
+        self._stop_custom_proc_if_any()
         exe = self.xray_exe_path
         if not os.path.exists(exe):
             raise FileNotFoundError(f"Xray binary missing at {exe}")
@@ -899,7 +1270,7 @@ class XrayProcessDriver:
                         or ("security=reality" in uri_low)
                         or ("security=none" in uri_low)
                     )
-                    init_vec_id = node.cached_vector_id or ("VEC-00" if is_direct else "VEC-21")
+                    init_vec_id = node.cached_vector_id or ("VEC-00" if is_direct else "VEC-24")
                     br = FullDuplexMutatorBridge(listen_port=b_port)
                     br.update_route(
                         remote_host=ep_host,
@@ -986,7 +1357,7 @@ class XrayProcessDriver:
                     ok, rtt, _ = TunnelStreamVerifier.fast_probe(hp, timeout=4.0)
 
                     if (not ok) and (not is_dir):
-                        for fb_vid in ("VEC-01", "VEC-20"):
+                        for fb_vid in ("VEC-25", "VEC-26", "VEC-01"):
                             if fb_vid == used_vec:
                                 continue
                             br.update_route(
@@ -1006,7 +1377,7 @@ class XrayProcessDriver:
                     if (not ok) and (not is_dir) and settings.auto_clean_ip and CleanIpScanner.is_cdn_eligible(nd):
                         fb_cdn_ip = cdn_lock.submit(_get_lazy_fallback_cdn_ip, nd.port).result()
                         if fb_cdn_ip and (fb_cdn_ip != active_ep):
-                            for fb_vid in ("VEC-21", "VEC-01"):
+                            for fb_vid in ("VEC-24", "VEC-25", "VEC-21"):
                                 br.update_route(
                                     remote_host=fb_cdn_ip,
                                     remote_port=nd.port,
@@ -1084,6 +1455,7 @@ class XrayProcessDriver:
         return results
 
     def stop(self):
+        self._stop_custom_proc_if_any()
         if self.proc is not None:
             try:
                 self.proc.terminate()

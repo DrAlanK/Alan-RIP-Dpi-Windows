@@ -294,8 +294,11 @@ class EngineSettings:
 
     routing_mode: str = "bypass_ir"
     per_app_mode: str = "off"
+    per_app_tunneled: int = 0
+    per_app_bypassed: int = 0
     per_app_list: str = ""
     per_app_isolate_system_proxy: bool = True
+    per_app_winhttp_sync: bool = False
     doh_shield_enabled: bool = False
     active_doh_url: str = "https://cloudflare-dns.com/dns-query"
     block_quic: bool = True
@@ -533,10 +536,11 @@ class TelemetrySnapshot:
 
 
 AUTOPILOT_PRIORITY_IDS: List[str] = [
-    "VEC-21", "VEC-22", "VEC-01", "VEC-18", "VEC-17", "VEC-19",
-    "VEC-20", "VEC-23", "VEC-04", "VEC-02", "VEC-03", "VEC-05",
-    "VEC-06", "VEC-07", "VEC-08", "VEC-09", "VEC-10", "VEC-15",
-    "VEC-16", "VEC-11", "VEC-13", "VEC-14", "VEC-12", "VEC-00",
+    "VEC-27", "VEC-28", "VEC-24", "VEC-25", "VEC-26", "VEC-19",
+    "VEC-20", "VEC-21", "VEC-22", "VEC-01", "VEC-18", "VEC-17",
+    "VEC-23", "VEC-04", "VEC-02", "VEC-03", "VEC-05", "VEC-06",
+    "VEC-07", "VEC-08", "VEC-09", "VEC-10", "VEC-15", "VEC-16",
+    "VEC-11", "VEC-13", "VEC-14", "VEC-12", "VEC-00",
 ]
 
 
@@ -564,6 +568,11 @@ VECTOR_REGISTRY: List[BypassVector] = [
     BypassVector("VEC-21", "Adaptive Core Omega", "PROPRIETARY", "Composite header boundary shift with forward window cut", outer_version=0x0303, hybrid_mode="phantom_seam_oob", uplink_mss_clamp=1380, coalesce_flight2=False),
     BypassVector("VEC-22", "Dual-Window Stream Core", "PROPRIETARY", "Segmented header cell alignment with secondary window cut", outer_version=0x0304, hybrid_mode="sni_microcell_pincer", uplink_mss_clamp=1360, coalesce_flight2=False),
     BypassVector("VEC-23", "Interleaved Record Sync", "COALESCE", "Alternating record header framing with forward segment split", outer_version=0x0301, hybrid_mode="chameleon_interleave", uplink_mss_clamp=1380, coalesce_flight2=False),
+    BypassVector("VEC-27", "Regional PMTU Guard (1180B)", "COALESCE", "RFC 4-record framing + strict <=1180B segment ceiling to defeat provincial PMTU blackholes", outer_version=0x0303, record_envelope="rfc_dot_keyshare_4rec", uplink_mss_clamp=1180, hybrid_mode="regional_pmtu_1180", coalesce_flight2=False),
+    BypassVector("VEC-28", "Anti-16KB Flow-Stall", "PROPRIETARY", "Flights 1-6 asymmetric 0x17 slicing + 920B sustained segment pacing against regional 16KB flow drops", preamble="2xzero", outer_version=0x0304, frag_flights=6, uplink_mss_clamp=920, hybrid_mode="anti_16kb_flow_stall", coalesce_flight2=True),
+    BypassVector("VEC-24", "Record-Boundary CWND Pacer", "COALESCE", "RFC 4-record dot/KeyShare framing with Token-Bucket CWND upload pacing", outer_version=0x0303, record_envelope="rfc_dot_keyshare_4rec", uplink_mss_clamp=980, hybrid_mode="cwnd_token_bucket", coalesce_flight2=False),
+    BypassVector("VEC-25", "Multi-Flight Asymmetric Desync", "PROPRIETARY", "Flights 1-4 asymmetric 0x17 frame slicing with 4MB RX / 96KB TX anti-stall buffer", preamble="2xzero", outer_version=0x0304, frag_flights=4, uplink_mss_clamp=1160, hybrid_mode="multiflight_asymmetric_0x17", coalesce_flight2=True),
+    BypassVector("VEC-26", "Fast-Path Offload Bypass", "PROPRIETARY", "NIC TSO/LSO offload bypass on handshake + Zero-Copy Bulk relay after 16KB", outer_version=0x0303, frag_flights=3, uplink_mss_clamp=1240, hybrid_mode="fastpath_nic_offload_bypass", coalesce_flight2=False),
     BypassVector("VEC-00", "Direct Tunnel Passthrough", "DIRECT", "Zero-mutation kernel relay for domestic tunnels and encrypted streams", "none", 0x0303, "none", [], coalesce_flight2=False),
 ]
 

@@ -34,6 +34,7 @@ from .pages import (
     ConfigsPage,
     HomePage,
     LabPage,
+    AboutPage,
     LogsPage,
     RoutingSettingsPage,
     SubscriptionManagerDialog,
@@ -165,6 +166,7 @@ class BackendControllerAdapter(QObject):
     scan_state_changed = Signal(bool, str)
     task_progress = Signal(bool, int, str)
     tun_status_changed = Signal(bool, bool, str)
+    update_checked = Signal(dict)
 
 
 class DemoDpiController(BackendControllerAdapter):
@@ -193,6 +195,11 @@ class DemoDpiController(BackendControllerAdapter):
         ("VEC-21", "Polymorphic Record Slicer"),
         ("VEC-22", "Dynamic Window Cadence"),
         ("VEC-23", "Symmetric Duplex Framing"),
+        ("VEC-24", "Record-Boundary CWND Pacer"),
+        ("VEC-25", "Multi-Flight Asymmetric Desync"),
+        ("VEC-26", "Fast-Path Offload Bypass"),
+        ("VEC-27", "Regional PMTU Guard (1180B)"),
+        ("VEC-28", "Anti-16KB Flow-Stall"),
     ]
 
     def __init__(self, parent=None):
@@ -510,6 +517,23 @@ class DemoDpiController(BackendControllerAdapter):
             target_vector="ALL",
             check_gemini=True,
             auto_connect=True,
+        )
+
+    def check_for_updates(self) -> None:
+        QTimer.singleShot(
+            450,
+            lambda: self.update_checked.emit(
+                {
+                    "ok": True,
+                    "has_update": False,
+                    "current_version": "1.5.0",
+                    "latest_version": "1.5.0",
+                    "release_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
+                    "download_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
+                    "notes": "",
+                    "error": "",
+                }
+            ),
         )
 
     def get_vectors(self) -> list:
@@ -1229,7 +1253,7 @@ class TopBrandHeaderBar(NeuCard):
         self.brand_lbl = QLabel("Alan-RIP-Dpi")
         enforce_english_ltr(self.brand_lbl, mono_size=12, bold=True)
 
-        self.ver_badge = QLabel("v1.1.0")
+        self.ver_badge = QLabel("v1.5.0")
         self.ver_badge.setObjectName("BadgePill")
         enforce_english_ltr(self.ver_badge, mono_size=9, bold=True)
 
@@ -1357,6 +1381,7 @@ class AlanMainWindow(QMainWindow):
         self.btn_lab = NavRailButton("lab", "nav_lab")
         self.btn_routing = NavRailButton("routing", "nav_routing")
         self.btn_logs = NavRailButton("logs", "nav_logs")
+        self.btn_about = NavRailButton("info", "nav_about")
 
         self._nav_buttons = (
             self.btn_home,
@@ -1364,6 +1389,7 @@ class AlanMainWindow(QMainWindow):
             self.btn_lab,
             self.btn_routing,
             self.btn_logs,
+            self.btn_about,
         )
         for idx, btn in enumerate(self._nav_buttons):
             self.nav_group.addButton(btn, idx)
@@ -1376,6 +1402,7 @@ class AlanMainWindow(QMainWindow):
         self.lab_page = LabPage()
         self.routing_page = RoutingSettingsPage()
         self.logs_page = LogsPage()
+        self.about_page = AboutPage()
 
         for pg in (
             self.home_page,
@@ -1383,6 +1410,7 @@ class AlanMainWindow(QMainWindow):
             self.lab_page,
             self.routing_page,
             self.logs_page,
+            self.about_page,
         ):
             self.pages.addWidget(pg)
 
@@ -1410,7 +1438,7 @@ class AlanMainWindow(QMainWindow):
             VectorIconPainter.build_tray_icon("IDLE", "assets/logo.png"),
             self,
         )
-        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.1.0")
+        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.5.0")
 
         self.tray_menu = QMenu(self)
         self.act_tray_conn = QAction(I18N.t("tray_connect"), self)
@@ -1535,6 +1563,9 @@ class AlanMainWindow(QMainWindow):
 
         self.configs_page.select_active_requested.connect(self._handle_vault_select_active)
         self.configs_page.import_clipboard_requested.connect(self._handle_import_clipboard)
+        self.configs_page.import_files_requested.connect(self._handle_import_files)
+        self.configs_page.refresh_single_sub_requested.connect(lambda grp: self._call_ctrl("refresh_single_subscription", grp))
+        self.configs_page.refresh_all_subs_requested.connect(lambda: self._call_ctrl("refresh_subscriptions"))
         self.configs_page.new_config_requested.connect(self._open_new_config_dialog)
         self.configs_page.edit_config_requested.connect(self._open_edit_config_dialog)
         self.configs_page.delete_configs_requested.connect(self._handle_delete_configs)
@@ -1563,6 +1594,7 @@ class AlanMainWindow(QMainWindow):
 
         self.routing_page.setting_key_changed.connect(self._handle_single_setting)
         self.routing_page.settings_changed.connect(self._handle_bulk_settings)
+        self.about_page.check_update_requested.connect(self._handle_check_updates)
         self.routing_page.discover_apps_requested.connect(self._handle_discover_apps)
         self.routing_page.launch_app_requested.connect(self._handle_launch_tunneled_app)
 
@@ -1580,6 +1612,7 @@ class AlanMainWindow(QMainWindow):
             (("scan_state_changed",), self.on_scan_state_changed),
             (("task_progress", "task_progress_updated"), self.on_task_progress),
             (("tun_status_changed", "tun_state_changed"), self.on_tun_status_changed),
+            (("update_checked",), self.on_update_checked),
         ]
         for names, slot in signal_bindings:
             for attr in names:
@@ -1852,6 +1885,35 @@ class AlanMainWindow(QMainWindow):
         self._settings_cache = merged
         self._call_ctrl("update_settings", merged)
 
+    def _handle_import_files(self, file_paths: list, group_tag: str) -> None:
+        if not file_paths:
+            return
+        fn_multi = getattr(self.controller, "import_configs_from_files", None)
+        if callable(fn_multi):
+            try:
+                fn_multi(file_paths, group_tag=group_tag)
+                return
+            except TypeError:
+                fn_multi(file_paths)
+                return
+        fn_single = getattr(self.controller, "import_configs_from_file", None)
+        if callable(fn_single):
+            for fp in file_paths:
+                try:
+                    fn_single(fp, group_tag=group_tag)
+                except TypeError:
+                    fn_single(fp)
+            return
+        chunks = []
+        for fp in file_paths:
+            try:
+                with open(fp, "r", encoding="utf-8-sig", errors="ignore") as fh:
+                    chunks.append(fh.read())
+            except Exception:
+                pass
+        if chunks:
+            self._handle_import_clipboard("\n".join(chunks), group_tag)
+
     def _handle_import_clipboard(self, raw_text: str, group_tag: str) -> None:
         fn = getattr(self.controller, "import_configs", None)
         if callable(fn):
@@ -1961,17 +2023,29 @@ class AlanMainWindow(QMainWindow):
         target_vector: str,
         check_gemini: bool,
         auto_connect: bool,
+        use_clean_ip: bool = False,
     ) -> None:
         fn = getattr(self.controller, "start_lab_scan", None)
         if callable(fn):
-            fn(
-                scope=scope,
-                uid_list=uid_list,
-                group_tag=group_tag,
-                target_vector=target_vector,
-                check_gemini=check_gemini,
-                auto_connect=auto_connect,
-            )
+            try:
+                fn(
+                    scope=scope,
+                    uid_list=uid_list,
+                    group_tag=group_tag,
+                    target_vector=target_vector,
+                    check_gemini=check_gemini,
+                    auto_connect=auto_connect,
+                    use_clean_ip=use_clean_ip,
+                )
+            except TypeError:
+                fn(
+                    scope=scope,
+                    uid_list=uid_list,
+                    group_tag=group_tag,
+                    target_vector=target_vector,
+                    check_gemini=check_gemini,
+                    auto_connect=auto_connect,
+                )
 
     def _handle_connect_lab_winner(self, vector_id: str, target_uid: str) -> None:
         self._call_ctrl("apply_scanned_vector", vector_id, target_uid, True)
@@ -2035,6 +2109,11 @@ class AlanMainWindow(QMainWindow):
 
         phase_key = "CONNECTING" if self._is_connecting else ("CONNECTED" if self._is_connected else "IDLE")
         self._sync_tray_state(phase_key)
+        if "per_app_tunneled" in enriched:
+            self.routing_page.update_per_app_stats(
+                int(enriched.get("per_app_tunneled") or 0),
+                int(enriched.get("per_app_bypassed") or 0),
+            )
         if "doh_shield_active" in enriched:
             self.lab_page.sync_doh_veil_state(
                 bool(enriched.get("doh_shield_active")),
@@ -2203,6 +2282,13 @@ class AlanMainWindow(QMainWindow):
         )
         self._sync_tray_state()
 
+    def _handle_check_updates(self) -> None:
+        self._call_ctrl("check_for_updates")
+
+    @Slot(dict)
+    def on_update_checked(self, info: dict) -> None:
+        self.about_page.apply_update_result(info)
+
     def toggle_language(self) -> None:
         new_lang = I18N.toggle_language()
         self._handle_single_setting("ui_language", new_lang)
@@ -2232,6 +2318,7 @@ class AlanMainWindow(QMainWindow):
             self.lab_page.retranslate_ui()
             self.routing_page.retranslate_ui()
             self.logs_page.retranslate_ui()
+            self.about_page.retranslate_ui()
 
             self.act_tray_proxy.setText(I18N.t("tray_sys_proxy"))
             self.act_tray_tun.setText(I18N.t("tray_tun_mode"))
@@ -2273,5 +2360,6 @@ class AlanMainWindow(QMainWindow):
             self.lab_page.set_palette_theme(palette)
             self.routing_page.set_palette_theme(palette)
             self.logs_page.set_palette_theme(palette)
+            self.about_page.set_palette_theme(palette)
         finally:
             self.setUpdatesEnabled(True)

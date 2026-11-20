@@ -35,6 +35,7 @@ class AlanQtBackendController(QObject):
     task_progress_updated = Signal(bool, int, str)
     tun_status_changed = Signal(bool, bool, str)
     auto_locations_updated = Signal(list, str)
+    update_checked = Signal(dict)
 
     def __init__(self, base_dir: str, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -58,6 +59,7 @@ class AlanQtBackendController(QObject):
         self.engine.on_task_progress = lambda a, p, m: self._post_ui(self.task_progress_updated, bool(a), int(p), str(m))
         self.engine.on_tun_status = lambda e, a, d: self._post_ui(self.tun_status_changed, bool(e), bool(a), str(d))
         self.engine.on_auto_locations = lambda locs, sel: self._post_ui(self.auto_locations_updated, list(locs), str(sel))
+        self.engine.on_update_checked = lambda info: self._post_ui(self.update_checked, dict(info))
         self.engine.on_request_quit = lambda: self._ui_queue.put(("__QUIT__", ()))
 
     def _post_ui(self, sig, *args):
@@ -116,6 +118,12 @@ class AlanQtBackendController(QObject):
     def scan_subscription_and_connect(self, sub_url_or_title: Any = "", title: str = ""):
         self.engine.hunt_subscription_and_connect(sub_url_or_title=sub_url_or_title, title=title)
 
+    def get_per_app_stats(self) -> dict:
+        return self.engine.per_app_gateway.get_stats()
+
+    def check_for_updates(self):
+        self.engine.check_for_updates()
+
     def get_vectors(self) -> list:
         return self.engine.get_vectors_as_dicts()
 
@@ -167,8 +175,11 @@ class AlanQtBackendController(QObject):
     def import_configs(self, raw_text: str, group_tag: str = "Manual") -> int:
         return self.engine.import_configs(raw_text, group_tag=group_tag)
 
-    def import_configs_from_file(self, file_path: str) -> int:
-        return self.engine.import_configs_from_file(file_path)
+    def import_configs_from_file(self, file_path: str, group_tag: str = "") -> int:
+        return self.engine.import_configs_from_file(file_path, group_tag=group_tag)
+
+    def import_configs_from_files(self, file_paths: list, group_tag: str = "") -> int:
+        return self.engine.import_configs_from_files(file_paths, group_tag=group_tag)
 
     def rename_config(self, index_or_uid: Any, new_name: str):
         self.engine.rename_config(index_or_uid, new_name)
@@ -227,6 +238,9 @@ class AlanQtBackendController(QObject):
     def add_subscription(self, url: str, title: str = "Subscription"):
         self.engine.add_subscription(url=url, title=title)
 
+    def refresh_single_subscription(self, title_or_url: str = "") -> bool:
+        return self.engine.refresh_single_subscription(title_or_url)
+
     def refresh_subscriptions(self):
         self.engine.refresh_all_subscriptions()
 
@@ -251,6 +265,7 @@ class AlanQtBackendController(QObject):
         target_vector: str = "ALL",
         check_gemini: bool = False,
         auto_connect: bool = False,
+        use_clean_ip: bool = False,
     ):
         self.engine.start_lab_scan(
             scope=scope,
@@ -260,6 +275,7 @@ class AlanQtBackendController(QObject):
             target_vector=target_vector,
             check_gemini=bool(check_gemini),
             auto_connect=bool(auto_connect),
+            use_clean_ip=bool(use_clean_ip),
         )
 
     def start_clean_ip_scan(self, port: int = 443):

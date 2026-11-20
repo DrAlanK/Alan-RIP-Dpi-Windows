@@ -1,9 +1,9 @@
 <div align="center">
   <img src="assets/logo.png" alt="Alan-RIP-Dpi Logo" width="110" />
-  <h1>Alan-RIP-Dpi (Windows Desktop) — v1.2.0</h1>
-  <p><b>Adaptive Anti-DPI Engine, Full-Duplex Byte Mutator & Xray Routing Client for Windows</b></p>
+  <h1>Alan-RIP-Dpi (Windows Desktop) — v1.5.0</h1>
+  <p><b>Adaptive Anti-DPI Engine, Full-Duplex Byte Mutator, Regional PMTU Guard & Xray Routing Client for Windows</b></p>
   <p>
-    <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest">Download Latest Release (v1.2.0)</a>
+    <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest">Download Latest Release (v1.5.0)</a>
     ·
     <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Android">Android Version (Alan-RIP-Dpi-Android)</a>
     ·
@@ -15,15 +15,18 @@
 
 ## معرفی اجمالی و تجربه کاربری (غیرفنی)
 
-**Alan-RIP-Dpi** ابزاری دسکتاپ برای ویندوز است که پیچیدگی‌های فنی دور زدن فیلترینگ (DPI)، پیدا کردن آی‌پی تمیز، تنظیم فرگمنت و تست صدها کانفیگ را به یک دکمه واحد تبدیل می‌کند:
+**Alan-RIP-Dpi** یک کلاینت دسکتاپ متن‌باز برای ویندوز مبتنی بر هسته **Xray-core** است که پیچیدگی‌های فنی دور زدن فیلترینگ (DPI)، رفع مشکل قفل شدن آپلود و سیاه‌چاله‌های شبکه‌های منطقه‌ای، تنظیم فرگمنت، تفکیک برنامه‌ها و تست صدها کانفیگ را در یک رابط کاربری نئومورفیک و یک‌کلیکی جمع کرده است:
 
-* **اتصال خودکار هوشمند با انتخابگر لوکیشن:** بدون نیاز به داشتن کانفیگ شخصی، برنامه به مخزن ابری متصل شده و امکان انتخاب کشور مقصد (آلمان، هلند، فنلاند، آمریکا و...) را فراهم می‌کند.
-* **شکارچی کامل لینک سابسکریپشن (Sub Hunter):** کافی است یک لینک اشتراک بدهید تا برنامه تمام کانفیگ‌های داخل آن را به‌صورت موازی پینگ و تست استریم کرده و خودکار به پایدارترین سرور (رتبه ۱) وصل شود.
-* **جریان کاری سه‌مرحله‌ای (`Configs -> Lab -> Home`):**
-  1. **کانفیگ‌ها (مخزن):** مدیریت تب‌بندی‌شده کانفیگ‌ها و ساب‌ها مشابه `v2rayNG` با پینگ واقعی همگانی و تست دسترسی **Gemini AI**.
-  2. **آزمایشگاه (Lab):** تست تک‌کانفیگ یا دسته‌جمعی روی تمام متدهای عبوری و انتقال خودکار خروجی‌های سالم (`VERIFIED`) به صفحه خانه.
-  3. **خانه (Home):** اتصال فوری، نمایش زنده آی‌پی و پرچم کشور خروجی، نمودار سرعت و پشتیبانی از System Tray ویندوز.
-* **حالت TUN یک‌کلیکی:** تونل کردن کل ترافیک ویندوز با دریافت خودکار دسترسی Administrator و نصب خودکار درایور `Wintun`.
+- **اتصال خودکار هوشمند با انتخابگر لوکیشن:** بدون نیاز به داشتن کانفیگ شخصی، برنامه به مخزن ابری متصل شده و امکان انتخاب کشور مقصد (آلمان، هلند، فنلاند، آمریکا و...) را فراهم می‌کند.
+- **تشخیص هوشمند کلیپ‌بورد و ایمپورت فایل (Drag & Drop):** کافی است لینک سابسکریپشن، کانفیگ‌های متنی یا متن Base64 را در کلیپ‌بورد کپی کنید؛ برنامه به‌صورت خودکار تشخیص می‌دهد لینک اشتراک است یا کانفیگ مستقیم. همچنین می‌توانید فایل‌های کانفیگ (Raw / Base64) را از طریق دکمه **«افزودن از فایل»** یا کشیدن و رها کردن (Drag & Drop) وارد کنید.
+- **بروزرسانی تکی و همگانی سابسکریپشن‌ها:** در نوار تب‌های کانفیگ می‌توانید فقط ساب فعال فعلی (**بروزرسانی همین ساب**) یا کل اشتراک‌ها (**بروزرسانی کل ساب‌ها**) را با یک کلیک آپدیت کنید.
+- **پشتیبانی از پروتکل‌های Xray و SOCKS5:** پشتیبانی کامل از `VLESS`، `VMess`، `Trojan`، `Shadowsocks`، `SOCKS5` (`socks://` / `socks5://`)، `Hysteria2` و `TUIC`.
+- **جریان کاری سه‌مرحله‌ای (`Configs -> Lab -> Home`):**
+  1. **کانفیگ‌ها (مخزن):** مدیریت تب‌بندی‌شده کانفیگ‌ها و ساب‌ها مشابه `v2rayNG` با پینگ واقعی موازی و تست دسترسی **Gemini**.
+  2. **آزمایشگاه (Lab):** تست دقیق تک‌کانفیگ یا دسته‌جمعی روی ۲۹ بردار عبوری همراه با **تست واقعی دانلود پیوسته (`160KB`) و سرعت واقعی آپلود (`KB/s` و `MB/s`)**، با تیک اختیاری تزریق آی‌پی تمیز (خاموش به‌صورت پیش‌فرض برای محافظت از کانفیگ‌های Railway و سرورهای مستقیم).
+  3. **خانه (Home):** اتصال فوری، انیمیشن نئومورفیک پویا با حباب‌های سه‌حالته ترافیک (رنگ‌بندی طبق پرچم کشور مقصد)، باکس پرچم برجسته، نمودار سرعت زنده و پشتیبانی از System Tray ویندوز.
+- **تفکیک حرفه‌ای برنامه‌ها (Per-App Split) و TUN ضد سیاه‌چاله:** تفکیک ترافیک برنامه‌های ویندوز در سطح کرنل (IPv4/IPv6 + HTTP & SOCKS5 + معافیت خودکار شبکه محلی و هماهنگی با حالت TUN با `MTU=1360`)، همگام‌سازی `WinHTTP` و لانچر اجرای مستقیم برنامه‌ها در تونل.
+- **سپر رمزنگاری DNS (DoH Shield) و بررسی خودکار بروزرسانی:** صفحه اختصاصی **«درباره»** با بررسی خودکار آخرین ریلیز گیت‌هاب و دسترسی مستقیم به مخازن و کانال تلگرام.
 
 > **نسخه اندروید:** برای استفاده روی موبایل، به ریپازیتوری رسمی اندروید در آدرس **[DrAlanK/Alan-RIP-Dpi-Android](https://github.com/DrAlanK/Alan-RIP-Dpi-Android)** مراجعه کنید.
 
@@ -39,41 +42,58 @@
 
 ## معماری فنی و نحوه عملکرد موتور (Technical Architecture)
 
-### ۱. نحوه قرارگیری Mutator در کنار هسته `Xray-core`
-در معماری `Alan-RIP-Dpi`، هسته استاندارد `xray.exe` وظیفه رمزنگاری پروتکل‌ها (`VLESS`, `VMess`, `Trojan`, `Shadowsocks`)، مدیریت `Split-DNS`، قوانین `Routing` و کارت شبکه مجازی `Wintun` (`AlanTUN`) را بر عهده دارد، اما مستقیماً به سرور راه دور متصل نمی‌شود.
+### ۱. نحوه قرارگیری Mutator و Per-App Gateway در کنار هسته `Xray-core`
 
-~~~text
-[ Windows Apps / AlanTUN ]
+در معماری `Alan-RIP-Dpi v1.5.0`، هسته استاندارد `xray.exe` وظیفه رمزنگاری پروتکل‌ها (`VLESS`, `VMess`, `Trojan`, `Shadowsocks`, `SOCKS5`, `Hysteria2`, `TUIC`)، مدیریت `Split-DNS`، قوانین `Routing` و کارت شبکه مجازی `Wintun` (`AlanTUN` با `MTU=1360`) را بر عهده دارد، اما مستقیماً به سرور راه دور متصل نمی‌شود.
+
+```text
+[ Windows Apps / Per-App Split Gateway (:10811) / AlanTUN (MTU 1360) ]
            │
            ▼  (SOCKS5 :10808 / HTTP :10809 / Wintun)
-   [ Xray-Core Engine ]  ──(Custom Polymorphic uTLS + Routing/DNS)
+   [ Xray-Core Engine ]  ──(Custom Polymorphic uTLS + Routing + DoH Shield)
            │
            ▼  (Local Loopback 127.0.0.1:20809)
-[ FullDuplexMutatorBridge ] ──(Byte-Level TLS/TCP Mutation: VEC-00..VEC-23)
+[ FullDuplexMutatorBridge ] ──(Byte-Level TLS/TCP Mutation: VEC-00..VEC-28)
            │
-           ▼  (Physical NIC Direct Socket / Loop-Free)
+           ▼  (Physical NIC Direct Socket / TCP_MAXSEG=1220 / Loop-Free)
    [ Remote Edge / Server ]
-~~~
+```
 
-خروجی `Xray-core` به `FullDuplexMutatorBridge` روی پورت محلی هدایت می‌شود. این پل دوطرفه اولین پرواز (`Flight 1` حاوی `TLS ClientHello` یا درخواست `HTTP Upgrade`) و پرواز دوم (`Flight 2` حاوی فریم‌های `Application Data 0x17` و `WebSocket EarlyData ?ed=2048`) را در سطح سوکت خام رهگیری کرده و بدون خراب کردن `Transcript-Hash` رمزنگاری TLS 1.3، تغییرات سطح بایت را اعمال می‌کند.
+خروجی Xray-core به FullDuplexMutatorBridge روی پورت محلی هدایت می‌شود. این پل دوطرفه نه تنها Flight 1 (TLS ClientHello) را در سطح بایت بازآرایی می‌کند، بلکه روی پروازهای ۲ تا ۶ (Application Data 0x17) و کل جریان آپلود نیز الگوریتم‌های کنترل پنجره ارسال (CWND Pacing)، کلمپینگ سگمنت و بافر نامتقارن اعمال می‌کند تا هم از DPI رفتاری عبور کند و هم جلوی قفل شدن آپلود و سیاه‌چاله‌های PMTU منطقه‌ای را بگیرد.
 
-### ۲. خانواده بردارهای عبوری (`VEC-00` تا `VEC-23`)
+### ۲. خانواده بردارهای عبوری (VEC-00 تا VEC-28 — ۲۹ بردار تخصصی)
 
-* **بردارهای تزریق خارج از باند (`MSG_OOB` Structural Desync):** ارسال بایت‌های فریب تصادفی با پرچم `URG` در لایه TCP روی آفست‌های حساس (`SNI Extension Tag`, `Length Field`, `Mid-Host`, `CipherSuites Pivot`) همراه با برش استراید با پنجره متغیر (`400B` / `360B`). پشته شبکه لینوکس سرور مقصد بایت `OOB` را دور می‌ریزد، اما ماشین حالت DPI در بازسازی توالی بایت‌ها دچار خطا می‌شود.
-* **بردارهای پاکت‌بندی و برش هندسی رکورد (`Record-Layer Framing & Slicing`):** شکستن بدنه `ClientHello` به چند رکورد معتبر `0x16` با نسخه‌های بیرونی متناوب (`0x0301`, `0x0303`, `0x0304`)، جداسازی مرز کاراکتر نقطه (`.`) در نام دامنه و برش پلکانی فیبوناچی (`[1, 2, 3, 5, 8]`) روی بافر `SNI` در یک فراخوانی واحد کرنل بدون تاخیر زمانی.
-* **بردارهای ترکیبی و سپر آپلود (`Hybrid & Uplink Shield`):** ترکیب رکورد فانتوم بدون SNI با جابه‌جایی مرز هدر، و کلمپینگ اندازه سگمنت‌های ۱۶ کیلوبایت اول آپلود (`MSS Clamping`) برای جلوگیری از قفل شدن پنجره ارسال TCP در استریم‌های WebSocket.
+- **سپر سیاه‌چاله PMTU و ضد قفل ۱۶ کیلوبایتی منطقه‌ای (VEC-27 و VEC-28 — جدید در v1.5.0):**
+  - **VEC-27 (Regional PMTU Guard - 1180B):** حل ریشه‌ای مشکل شبکه‌های استانی و دکل‌های موبایل (مانند برخی گیت‌وی‌های کرج/البرز و شهرستان‌ها) که در آن‌ها پینگ و لوکیشن ثابت است اما وب‌گردی قفل می‌شود؛ با برش استاندارد ۴رکوردی TLS 1.3 و قفل کردن سقف سگمنت‌های ارسالی زیر 1180B در کل نشست همراه با TCP_MAXSEG=1220.
+  - **VEC-28 (Anti-16KB Flow-Stall):** تقطیع نامتقارن پروازهای ۱ تا ۶ (0x16 + 0x17) همراه با شکل‌دهی جریان روی سقف 920B برای عبور از فیلترهای خفه‌کننده جریان‌های بالای ۱۶ تا ۳۲ کیلوبایت.
+- **بردارهای پرچمدار ضد قفل آپلود (VEC-24 تا VEC-26):**
+  - **VEC-24 (Record-Boundary CWND Pacer):** تقطیع دقیق مرز رکورد روی نقاط دامنه (.) و اکستنشن KeyShare + الگوریتم Token-Bucket CWND Pacing روی ۴۸ کیلوبایت اول آپلود بدون استفاده از بایت OOB.
+  - **VEC-25 (Multi-Flight Asymmetric Desync):** شکست امضای طول بسته‌های 0x17 در پروازهای ۱ تا ۴ + بافر نامتقارن سوکت (4MB RX / 96KB TX) برای حذف Bufferbloat و قفل آپلود.
+  - **VEC-26 (Fast-Path Offload Bypass):** دور زدن تجمیع سخت‌افزاری TSO/LSO کارت شبکه ویندوز در هندشیک و ورود به حالت Bulk Relay پس از ۱۶ کیلوبایت اول.
+- **بردارهای تزریق خارج از باند (MSG_OOB Structural Desync):** ارسال بایت‌های فریب با پرچم URG روی آفست‌های حساس (SNI Tag, Length, Mid-Host, CipherSuites Pivot) همراه با برش استراید پویا.
+- **بردارهای پاکت‌بندی و برش هندسی رکورد (Record-Layer Framing & Slicing):** شکستن ClientHello به چند رکورد استاندارد 0x16 با نسخه‌های بیرونی متناوب و برش فیبوناچی در یک فراخوانی واحد کرنل.
 
-### ۳. منطق `Origin-First` و محافظت از کانفیگ‌های PaaS
+### ۳. راستی‌آزمایی واقعی جریان (160KB Download + 192KB Real Upload)
 
-موتور پیش از هرگونه تزریق آی‌پی، ابتدا هاست اصلی کانفیگ (`original_host`) را با حلول `DoH` ضد مسمومیت تست می‌کند. دامنه‌ها و `CNAME`های سرویس‌های PaaS (مانند `Railway`, `Render`, `Fly.io`, `Vercel`, `Koyeb`) به‌طور خودکار شناسایی و از دریافت آی‌پی کلودفلر معاف می‌شوند. اسکنر موازی آی‌پی تمیز (مجهز به تستر `ssl.MemoryBIO` روی `/cdn-cgi/trace`) صرفاً به عنوان **Fallback** زمانی وارد عمل می‌شود که هاست اصلی مسدود بوده و واجد شرایط CDN کلودفلر باشد.
+برخلاف تسترهای ساده که فقط یک generate_204 کوچک ارسال می‌کنند و در مناطق دارای PMTU Blackhole دچار خطای مثبت کاذب می‌شوند، موتور verifier.py در نسخه v1.5.0 قبل از تایید نهایی هر متد، سه مرحله واقعی را می‌سنجد:
 
-### ۴. فینگرپرینت چندریختی (`Custom Polymorphic uTLS`)
+1. پینگ اولیه و تست استریم یوتیوب
+2. تست دانلود پیوسته 160KB (Sustained Download Probe) برای شناسایی و رد فوری متدهایی که بعد از ۱۶ کیلوبایت فریز می‌شوند.
+3. تست واقعی سرعت آپلود 192KB روی سرور دریافت واقعی (speed.cloudflare.com/__up با فال‌بک) و نمایش سرعت دقیق بر حسب KB/s و MB/s در ستون اختصاصی آزمایشگاه.
 
-برای جلوگیری از مسدودسازی بر اساس امضای ثابت مرورگرها (`JA3`/`JA4` کروم یا فایرفاکس)، پروفایل پیش‌فرض `custom_poly` در هر نشست امضای کلاینت، ترتیب اکستنشن‌ها، مقادیر `GREASE` و بایت‌های فریب سطح سیم را به‌صورت پویا تغییر می‌دهد و هم‌زمان روی کانفیگ‌های WebSocket مقدار `ALPN` را روی `http/1.1` قفل می‌کند.
+### ۴. منطق Origin-First، محافظت PaaS و کنترل اختیاری آی‌پی تمیز
 
-### ۵. ساختار پروژه
+- در آزمایشگاه (Lab)، تزریق خودکار آی‌پی تمیز به‌صورت پیش‌فرض خاموش است تا کانفیگ‌های Railway، Render، Fly.io، SOCKS5 و سرورهای مستقیم دست‌نخورده تست شوند؛ کاربران در صورت نیاز به اسکن کلودفلر می‌توانند تیک «تزریق خودکار IP تمیز (هنگام اسکن)» را فعال کنند.
+- فینگرپرینت چندریختی Custom Polymorphic uTLS به‌صورت پیش‌فرض امضای کلاینت، ترتیب اکستنشن‌ها و مقادیر GREASE را در هر اتصال تغییر می‌دهد.
 
-~~~text
+### ۵. موتور Per-App Split Tunneling (سطح کرنل ویندوز)
+
+- شناسایی لحظه‌ای پردازش مالک هر اتصال TCP روی IPv4 و IPv6 از طریق iphlpapi.dll (GetExtendedTcpTable) همراه با کش درخت پردازش (تا ۸ لایه والد/فرزند).
+- پشتیبانی کامل از HTTP/HTTPS و SOCKS5 در هر دو حالت تونل و عبور مستقیم (Bypass)، معافیت خودکار آی‌پی‌های شبکه محلی (LAN / Private CIDR)، مقیدسازی سوکت‌های معاف به کارت شبکه فیزیکی در حالت TUN، و شمارنده زنده اتصالات تفکیک‌شده.
+
+### ۶. ساختار پروژه
+
+```plaintext
 Alan-RIP-Dpi/
 ├── main.py                      # نقطه ورود، مدیریت فونت‌ها و همگام‌ساز ترد اصلی Qt
 ├── build_release.ps1            # اسکریپت ساخت نسخه پرتابل ویندوز (PyInstaller)
@@ -81,49 +101,40 @@ Alan-RIP-Dpi/
 ├── assets/                      # آیکون‌ها و فونت‌های باندل‌شده (Vazirmatn / JetBrainsMono)
 └── alan_dpi/
     ├── engine/
-    │   ├── models.py            # مدل‌های داده، رجیستری ۲۴ بردار و LocationExtractor
-    │   ├── mutator.py           # پارسر بایتی ClientHello و موتور دستکاری پکت‌های TLS/HTTP
-    │   ├── bridge.py            # پراکسی محلی Full-Duplex با بافر 4MB و مقیدسازی ضد حلقه TUN
-    │   ├── xray_driver.py       # کامپایلر کانفیگ Xray، قوانین Routing و موتور پینگ موازی
+    │   ├── models.py            # مدل‌های داده، رجیستری ۲۹ بردار (VEC-00..28) و LocationExtractor
+    │   ├── mutator.py           # پارسر بایتی ClientHello، برش چندپروازه 0x17 و NIC Offload Bypass
+    │   ├── bridge.py            # پراکسی Full-Duplex با بافر نامتقارن، CWND Pacing و PMTU Guard
+    │   ├── xray_driver.py       # کامپایلر Xray (V2Ray + SOCKS5)، قوانین Routing و پینگ موازی
     │   ├── clean_ip.py          # رادار CIDR کلودفلر با تستر MemoryBIO و فیلتر محافظ PaaS
-    │   ├── verifier.py          # راستی‌آزمایی استریم ۶ ثانیه‌ای، تست آپلود و تشخیص دیتاسنتر 
-    │   ├── tun_manager.py       # مدیریت کارت مجازی Wintun، جدول Route و ارتقای UAC
+    │   ├── verifier.py          # تستر دانلود پیوسته 160KB، سرعت واقعی آپلود 192KB و Gemini
+    │   ├── per_app_proxy.py     # گیت‌وی تفکیک برنامه‌ها (IPv4/IPv6 PID Mapper + HTTP/SOCKS5 + WinHTTP)
+    │   ├── doh_shield.py        # سپر رمزنگاری DNS (DNS-over-HTTPS)
+    │   ├── tun_manager.py       # مدیریت کارت مجازی Wintun (MTU 1360)، جدول Route و ارتقای UAC
+    │   ├── updater.py           # سرویس بررسی خودکار آخرین ریلیز از GitHub API
     │   ├── autopilot.py         # ماشین حالت اتصال خودکار، شکارچی ساب و نگهبان خودترمیم‌گر
     │   └── qt_adapter.py        # پل ارتباطی سیگنال‌ها و صف Thread-Safe رابط گرافیکی
-    └── ui/                      # صفحات رابط کاربری دوزبانه (Home, Configs, Lab, Routing, Logs)
-~~~
-
----
+    └── ui/                      # رابط نئومورفیک دوزبانه (Home, Configs, Lab, Settings, Logs, About)
+```
 
 ## منابع و پروژه‌های استفاده‌شده (Credits & Third-Party)
 
 این پروژه بر پایه‌ی کارهای متن‌باز زیر ساخته شده است و از همه‌ی توسعه‌دهندگانشان سپاسگزاریم:
 
-* **[Xray-core](https://github.com/XTLS/Xray-core)** — هسته‌ی اصلی مسیریابی و پروتکل‌ها (`VLESS`, `VMess`, `Trojan`, `Shadowsocks`). این پروژه از باینری رسمی `xray.exe` استفاده می‌کند و تحت لایسنس **MPL-2.0** منتشر شده است.
-* **[Wintun](https://www.wintun.net/)** — درایور کارت شبکه‌ی مجازی لایه ۳ برای حالت TUN (ساخته‌ی تیم WireGuard).
-* **[Qt for Python (PySide / PyQt)](https://www.qt.io/qt-for-python)** — چارچوب رابط گرافیکی.
-* **[PyInstaller](https://pyinstaller.org/)** — ساخت نسخه‌ی Portable.
-* **[Vazirmatn](https://github.com/rastikerdar/vazirmatn)** و **[JetBrains Mono](https://github.com/JetBrains/JetBrainsMono)** — فونت‌های باندل‌شده (لایسنس OFL).
-* **Geoip / Geosite** — دیتابیس‌های مسیریابی جغرافیایی همراه هسته‌ی Xray.
+- [Xray-core](https://github.com/XTLS/Xray-core) — هسته‌ی اصلی مسیریابی و پروتکل‌ها (VLESS, VMess, Trojan, Shadowsocks, SOCKS5, Hysteria2, TUIC) تحت لایسنس MPL-2.0.
+- [Wintun](https://www.wintun.net/) — درایور کارت شبکه‌ی مجازی لایه ۳ برای حالت TUN (ساخته‌ی تیم WireGuard).
+- [Qt for Python (PySide6)](https://www.qt.io/qt-for-python) — چارچوب رابط گرافیکی.
+- [PyInstaller](https://pyinstaller.org/) — ساخت نسخه‌ی Portable.
+- [Vazirmatn](https://github.com/rastikerdar/vazirmatn) و [JetBrains Mono](https://github.com/JetBrains/JetBrainsMono) — فونت‌های باندل‌شده (لایسنس OFL).
+- Geoip / Geosite — دیتابیس‌های مسیریابی جغرافیایی همراه هسته‌ی Xray.
 
 هر کدام از این پروژه‌ها تحت لایسنس خودشان هستند و لایسنس Alan-RIP-Dpi روی آن‌ها اعمال نمی‌شود.
 
----
-
 ## قدردانی (Acknowledgments)
 
-* تشکر و قدردانی ویژه از **[Floxu1](https://github.com/Floxu1/)** بابت ابداع متد **OOB (Out-of-Band)** و کمک‌های فنی ارزشمند ایشان در روند طراحی و تکامل متدهای عبوری این پروژه.
-
----
+تشکر و قدردانی ویژه از [Floxu1](https://github.com/Floxu1/) بابت ابداع متد OOB (Out-of-Band) و کمک‌های فنی ارزشمند ایشان در روند طراحی و تکامل متدهای عبوری این پروژه.
 
 ## لایسنس (License)
 
-این پروژه تحت لایسنس **MIT** منتشر شده است. متن کامل لایسنس در فایل [LICENSE](LICENSE) موجود است.
+این پروژه تحت لایسنس MIT منتشر شده است. متن کامل لایسنس در فایل [LICENSE](https://www.google.com/search?q=LICENSE) موجود است.
 
 استفاده، کپی، تغییر و توزیع آزاد است، به شرطی که اعلان کپی‌رایت و متن لایسنس حفظ شود. نرم‌افزار «همان‌طور که هست» و بدون هیچ‌گونه ضمانتی ارائه می‌شود.
-
----
-
-<div align="center">
-  <p>ساخته‌شده با ❤️ توسط <a href="https://github.com/DrAlanK">DrAlanK</a> · <a href="https://t.me/LabALan">@LabALan</a></p>
-</div>

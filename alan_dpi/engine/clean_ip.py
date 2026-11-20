@@ -201,7 +201,7 @@ class CleanIpScanner:
 
     @staticmethod
     def is_domestic_or_direct_tunnel(node: ProfileNode) -> bool:
-        if node.protocol.upper() in ("SHADOWSOCKS", "SOCKS"):
+        if node.protocol.upper() in ("SHADOWSOCKS", "SOCKS", "SOCKS5", "SOCKS4"):
             return True
         host_lower = (node.original_host or "").lower().strip()
         if host_lower.endswith(".ir"):
@@ -212,7 +212,7 @@ class CleanIpScanner:
     def is_cdn_eligible(cls, node: ProfileNode) -> bool:
         proto_upper = node.protocol.upper()
         uri_lower = node.uri.lower()
-        if proto_upper in ("SHADOWSOCKS", "SOCKS"):
+        if proto_upper in ("SHADOWSOCKS", "SOCKS", "SOCKS5", "SOCKS4"):
             return False
         if "security=reality" in uri_lower:
             return False
