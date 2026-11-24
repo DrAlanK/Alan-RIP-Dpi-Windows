@@ -241,6 +241,29 @@ class AlanQtBackendController(QObject):
     def refresh_single_subscription(self, title_or_url: str = "") -> bool:
         return self.engine.refresh_single_subscription(title_or_url)
 
+    def apply_pro_settings(self, payload: dict) -> dict:
+        return self.engine.apply_pro_settings(payload)
+
+    def get_hardware_usage(self) -> dict:
+        return self.engine.get_hardware_usage()
+
+    def benchmark_dns_servers(self, callback=None) -> None:
+        self.engine.benchmark_dns_servers_async(callback=callback)
+
+    def flush_windows_dns_cache(self) -> str:
+        return self.engine.flush_windows_dns_cache()
+
+    def hot_reload_active_connection(self) -> bool:
+        return self.engine.hot_reload_active_connection()
+
+    def trim_hardware_memory(self) -> dict:
+        return self.engine.trim_hardware_memory()
+
+
+
+
+
+
     def refresh_subscriptions(self):
         self.engine.refresh_all_subscriptions()
 

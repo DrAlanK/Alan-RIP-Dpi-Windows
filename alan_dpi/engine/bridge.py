@@ -4,17 +4,79 @@ import random
 import socket
 import subprocess
 import threading
+try:
+    threading.stack_size(131072)
+except Exception:
+    pass
 import time
 from typing import Callable, Optional
 from alan_dpi.engine.models import BypassVector, VECTOR_REGISTRY
 from alan_dpi.engine.mutator import TlsByteMutator
 
+import collections
+
+BRIDGE_TUNING = {
+    "rcvbuf": 262144,
+    "sndbuf": 98304,
+    "mss": 1220,
+    "nodelay": True,
+    "keepalive": 30,
+    "idle_timeout": 180,
+}
+
+
+class _RelayBufferPool:
+    """Thread-safe reusable bytearray pool (eliminates per-connection heap churn & GC spikes)."""
+
+    def __init__(self, buf_size: int = 32768, max_items: int = 32):
+        self._buf_size = buf_size
+        self._max_items = max_items
+        self._pool = collections.deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> bytearray:
+        with self._lock:
+            if self._pool:
+                return self._pool.pop()
+        return bytearray(self._buf_size)
+
+    def release(self, buf: bytearray) -> None:
+        if len(buf) != self._buf_size:
+            return
+        with self._lock:
+            if len(self._pool) < self._max_items:
+                self._pool.append(buf)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._pool.clear()
+
+
+_RELAY_BUF_POOL = _RelayBufferPool(32768, 32)
+
+
+def configure_bridge_tuning(
+    rcvbuf_kb: int = 256,
+    sndbuf_kb: int = 96,
+    mss: int = 1220,
+    nodelay: bool = True,
+    keepalive_sec: int = 30,
+    idle_timeout: int = 180,
+) -> None:
+    BRIDGE_TUNING["rcvbuf"] = max(65536, min(1048576, int(rcvbuf_kb) * 1024))
+    BRIDGE_TUNING["sndbuf"] = max(32768, min(524288, int(sndbuf_kb) * 1024))
+    BRIDGE_TUNING["mss"] = max(0, min(1460, int(mss)))
+    BRIDGE_TUNING["nodelay"] = bool(nodelay)
+    BRIDGE_TUNING["keepalive"] = max(0, min(300, int(keepalive_sec)))
+    BRIDGE_TUNING["idle_timeout"] = max(45, min(600, int(idle_timeout)))
+
+
 
 class FullDuplexMutatorBridge:
     RECV_BUFFER = 65536
-    RX_SOCK_BUF = 4 * 1024 * 1024
+    RX_SOCK_BUF = 262144
     TX_ASYMMETRIC_BUF = 98304
-    TX_BULK_FASTPATH_BUF = 524288
+    TX_BULK_FASTPATH_BUF = 131072
 
     def __init__(
         self,
@@ -41,6 +103,8 @@ class FullDuplexMutatorBridge:
         self._active_sockets: set = set()
 
         self.tx_bytes_total: int = 0
+        self._last_diag_ts: float = 0.0
+        self._last_drop_ts: float = 0.0
         self.rx_bytes_total: int = 0
         self.active_session_count: int = 0
 
@@ -186,11 +250,21 @@ class FullDuplexMutatorBridge:
                 remote.bind((bind_ip, 0))
             except Exception:
                 pass
+        _t_dial = time.perf_counter()
         remote.connect((host, int(port)))
+        _now_d = time.monotonic()
+        if (_now_d - getattr(self, '_last_diag_ts', 0.0)) > 8.0:
+            self._last_diag_ts = _now_d
+            _d_ms = int((time.perf_counter() - _t_dial) * 1000)
+            _v = getattr(self, 'active_vector', None)
+            _vid = getattr(_v, 'vector_id', 'DIRECT')
+            _vmode = getattr(_v, 'hybrid_mode', '') or getattr(_v, 'family', '')
+            if hasattr(self, '_log'):
+                self._log(f'[Mutator-Net] Upstream TCP connected in {_d_ms}ms -> {self.remote_host}:{self.remote_port} | Vector={_vid} ({_vmode})')
         remote.settimeout(None)
         try:
             if hasattr(socket, 'TCP_MAXSEG'):
-                remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, 1220)
+                remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_MAXSEG, BRIDGE_TUNING["mss"] or 1220)
         except Exception:
             pass
         return remote

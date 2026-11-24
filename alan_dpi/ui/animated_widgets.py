@@ -1,3 +1,4 @@
+import os
 import random
 import math
 import re
@@ -790,7 +791,7 @@ class GlobalTaskStrip(QFrame):
         self._anim.finished.connect(self._on_anim_done)
 
         self._spin_timer = QTimer(self)
-        self._spin_timer.setInterval(30)
+        self._spin_timer.setInterval(16)
         self._spin_timer.timeout.connect(self._tick_spin)
 
         self._hide_timer = QTimer(self)
@@ -1479,7 +1480,7 @@ class AnimatedRadarCore(QWidget):
         self._glow_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
         self._timer = QTimer(self)
-        self._timer.setInterval(30)
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -2043,7 +2044,7 @@ class TacticalChronometerWidget(QWidget):
         self._arc_angle = 0.0
 
         self._timer = QTimer(self)
-        self._timer.setInterval(45)
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -2143,7 +2144,7 @@ class RouteTopologyStrip(QWidget):
         self._flow = 0.0
 
         self._timer = QTimer(self)
-        self._timer.setInterval(30)
+        self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
@@ -2622,3 +2623,89 @@ class JustifiedFlowLayout(QLayout):
             y += row_h + v_sp
 
         return max(0, (y - v_sp) - eff.y() + m.top() + m.bottom())
+
+
+def _trim_windows_working_set() -> None:
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = ctypes.c_void_p
+        k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+        k32.SetProcessWorkingSetSize.restype = ctypes.c_int
+        k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+    except Exception:
+        pass
+
+
+class PowerAwareTimerController(QObject):
+    """
+    Zero-impact RAM/CPU guard:
+      - Keeps animations 100% smooth while window is visible (unless Eco Mode is enabled).
+      - Caps QPlainTextEdit log memory dynamically (default 250 lines).
+      - Pauses animation timers + trims Windows working-set RAM when minimized or in Tray.
+      - Resumes all paused timers unconditionally when window returns to foreground.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._paused_timers: set = set()
+        self.tray_ram_trim_enabled: bool = True
+        self.eco_mode: bool = False
+        self.max_log_lines: int = 250
+
+    def configure(self, max_log_lines: int = 250, tray_ram_trim: bool = True, eco_mode: bool = False, root: QWidget = None) -> None:
+        self.max_log_lines = max(80, min(1500, int(max_log_lines or 250)))
+        self.tray_ram_trim_enabled = bool(tray_ram_trim)
+        self.eco_mode = bool(eco_mode)
+        if root is not None:
+            self.optimize_widget_tree(root)
+            if self.eco_mode:
+                self.pause_animations_in(root, trim_ws=False)
+            elif not (root.isMinimized() or root.isHidden()):
+                self.resume_animations_in(root)
+
+    def optimize_widget_tree(self, root: QWidget) -> int:
+        if root is None:
+            return 0
+        capped = 0
+        try:
+            from PySide6.QtWidgets import QPlainTextEdit
+            for ed in root.findChildren(QPlainTextEdit):
+                if ed.maximumBlockCount() == 0 or ed.maximumBlockCount() != self.max_log_lines:
+                    ed.setMaximumBlockCount(self.max_log_lines)
+                    capped += 1
+        except Exception:
+            pass
+        return capped
+
+    def pause_animations_in(self, root: QWidget, trim_ws: bool = True) -> int:
+        if root is None:
+            return 0
+        paused = 0
+        for t in root.findChildren(QTimer):
+            iv = int(t.interval())
+            if t.isActive() and (1 <= iv <= 120):
+                t.stop()
+                self._paused_timers.add(t)
+                paused += 1
+        if trim_ws and self.tray_ram_trim_enabled:
+            import gc
+            gc.collect()
+            _trim_windows_working_set()
+        return paused
+
+    def resume_animations_in(self, root: QWidget) -> int:
+        if root is None or self.eco_mode:
+            return 0
+        resumed = 0
+        for t in list(self._paused_timers):
+            self._paused_timers.discard(t)
+            try:
+                if not t.isActive():
+                    t.start()
+                    resumed += 1
+            except RuntimeError:
+                pass
+        return resumed

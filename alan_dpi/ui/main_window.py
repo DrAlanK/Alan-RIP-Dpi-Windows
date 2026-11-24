@@ -61,6 +61,7 @@ from .theme import (
     strip_emojis,
 )
 from .vector_icons import VectorIconPainter
+from alan_dpi.ui.animated_widgets import PowerAwareTimerController
 
 _IPV4_COUNTRY_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
     (
@@ -526,8 +527,8 @@ class DemoDpiController(BackendControllerAdapter):
                 {
                     "ok": True,
                     "has_update": False,
-                    "current_version": "1.5.0",
-                    "latest_version": "1.5.0",
+                    "current_version": "1.6.0",
+                    "latest_version": "1.6.0",
                     "release_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
                     "download_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
                     "notes": "",
@@ -1253,7 +1254,7 @@ class TopBrandHeaderBar(NeuCard):
         self.brand_lbl = QLabel("Alan-RIP-Dpi")
         enforce_english_ltr(self.brand_lbl, mono_size=12, bold=True)
 
-        self.ver_badge = QLabel("v1.5.0")
+        self.ver_badge = QLabel("v1.6.0")
         self.ver_badge.setObjectName("BadgePill")
         enforce_english_ltr(self.ver_badge, mono_size=9, bold=True)
 
@@ -1428,17 +1429,16 @@ class AlanMainWindow(QMainWindow):
         self._wire_pages_and_controller()
         self._hydrate_from_controller()
         self.apply_theme(DARK_PALETTE)
+        self._setup_power_guard()
+        self._wire_pro_settings_hub()
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        apply_windows_titlebar_theme(self, self._palette.is_dark)
 
     def _setup_system_tray(self) -> None:
         self.tray_icon = QSystemTrayIcon(
             VectorIconPainter.build_tray_icon("IDLE", "assets/logo.png"),
             self,
         )
-        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.5.0")
+        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.6.0")
 
         self.tray_menu = QMenu(self)
         self.act_tray_conn = QAction(I18N.t("tray_connect"), self)
@@ -2363,3 +2363,84 @@ class AlanMainWindow(QMainWindow):
             self.about_page.set_palette_theme(palette)
         finally:
             self.setUpdatesEnabled(True)
+
+    def _setup_power_guard(self) -> None:
+        self._power_guard = PowerAwareTimerController(self)
+        self._power_guard.optimize_widget_tree(self)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        pg = getattr(self, '_power_guard', None)
+        if pg is None:
+            return
+        if self.isMinimized():
+            pg.pause_animations_in(self)
+        elif not self.isHidden():
+            pg.resume_animations_in(self)
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        pg = getattr(self, '_power_guard', None)
+        if pg is not None:
+            pg.pause_animations_in(self)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        pg = getattr(self, '_power_guard', None)
+        if pg is not None:
+            pg.resume_animations_in(self)
+
+    def _wire_pro_settings_hub(self) -> None:
+        rp = getattr(self, 'routing_page', None) or getattr(self, 'settings_page', None)
+        if rp is None or not hasattr(rp, 'pro_settings_saved'):
+            return
+        def _apply_power_from_dict(sd: dict):
+            pg = getattr(self, '_power_guard', None)
+            if pg is not None and isinstance(sd, dict):
+                pg.configure(
+                    max_log_lines=int(sd.get('max_log_lines') or 250),
+                    tray_ram_trim=bool(sd.get('tray_ram_trim_enabled', True)),
+                    eco_mode=bool(sd.get('eco_low_power_mode', False)),
+                    root=self,
+                )
+        def _on_save_pro(payload: dict):
+            sd = self._call_ctrl('apply_pro_settings', payload) or payload
+            _apply_power_from_dict(sd)
+            hw = self._call_ctrl('get_hardware_usage')
+            if isinstance(hw, dict):
+                rp.update_hardware_badge(hw)
+        def _on_hot_reload(payload: dict):
+            _on_save_pro(payload)
+            reloaded = self._call_ctrl('hot_reload_active_connection')
+            if not reloaded:
+                rp.pro_status_lbl.setText('\u200fتنظیمات ذخیره شد (در حال حاضر اتصالی فعال نیست؛ در اتصال بعدی اعمال می‌شود).')
+        def _on_dns_bench():
+            if hasattr(rp, 'btn_dns_bench'): rp.btn_dns_bench.setEnabled(False)
+            if hasattr(rp, 'dns_lab_status'): rp.dns_lab_status.setText('\u200fدر حال اجرای بنچمارک DoH و تست مسمومیت UDP (10.10.34.x)...')
+            self._call_ctrl('benchmark_dns_servers', lambda best, msg: rp.dns_benchmark_finished.emit(str(best or ''), str(msg or '')))
+        def _on_dns_flush():
+            res_txt = self._call_ctrl('flush_windows_dns_cache') or 'انجام شد.'
+            if hasattr(rp, 'dns_lab_status'): rp.dns_lab_status.setText('\u200f' + str(res_txt))
+        def _on_trim_ram():
+            hw = self._call_ctrl('trim_hardware_memory')
+            if isinstance(hw, dict): rp.update_hardware_badge(hw)
+        def _on_refresh_hw():
+            hw = self._call_ctrl('get_hardware_usage')
+            if isinstance(hw, dict): rp.update_hardware_badge(hw)
+        rp.pro_settings_saved.connect(_on_save_pro)
+        rp.pro_hot_reload_requested.connect(_on_hot_reload)
+        rp.dns_benchmark_requested.connect(_on_dns_bench)
+        rp.dns_flush_requested.connect(_on_dns_flush)
+        rp.hw_trim_ram_requested.connect(_on_trim_ram)
+        rp.hw_refresh_stats_requested.connect(_on_refresh_hw)
+        ctrl = getattr(self, 'controller', None)
+        if ctrl is not None and hasattr(ctrl, 'engine'):
+            s_dict = ctrl.engine.settings.to_dict() if hasattr(ctrl.engine.settings, 'to_dict') else vars(ctrl.engine.settings)
+            rp.load_pro_settings(s_dict)
+            _apply_power_from_dict(s_dict)
+            rp.update_hardware_badge(ctrl.engine.get_hardware_usage())
+
+
+
+
+

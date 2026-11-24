@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 
 
 APP_NAME = "Alan-RIP-Dpi"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.6.0"
 
 
 COUNTRY_METADATA: Dict[str, Tuple[str, str]] = {
@@ -330,6 +330,54 @@ class EngineSettings:
     socks_port: int = 10808
     http_port: int = 10809
     bridge_port: int = 20809
+    allow_lan: bool = False
+    block_quic_udp443: bool = True
+    sniffing_enabled: bool = True
+    sniffing_route_only: bool = False
+    xray_log_level: str = "error"
+    tls_fingerprint_override: str = "keep"
+    tls_alpn_override: str = "keep"
+    allow_insecure_tls: bool = False
+    dns_query_strategy: str = "UseIPv4"
+    remote_dns_server: str = "https://1.1.1.1/dns-query"
+    direct_dns_server: str = "178.22.122.100"
+    fake_dns_enabled: bool = False
+    dns_disable_fallback: bool = True
+    dns_disable_cache: bool = False
+    routing_domain_strategy: str = "IPIfNonMatch"
+    block_ads_malware: bool = True
+    bypass_lan_private: bool = True
+    custom_proxy_rules: str = ""
+    custom_direct_rules: str = ""
+    custom_block_rules: str = ""
+    tcp_nodelay_enabled: bool = True
+    tcp_fast_open: bool = False
+    tcp_keepalive_sec: int = 30
+    tcp_maxseg_override: int = 1220
+    socket_rcvbuf_kb: int = 256
+    socket_sndbuf_kb: int = 96
+    xray_fragment_enabled: bool = False
+    xray_fragment_packets: str = "tlshello"
+    xray_fragment_length: str = "10-30"
+    xray_fragment_interval: str = "5-15"
+    xray_mem_limit_mb: int = 48
+    xray_gogc_percent: int = 40
+    xray_policy_buffer_kb: int = 128
+    xray_conn_idle_sec: int = 180
+    max_log_lines: int = 250
+    tray_ram_trim_enabled: bool = True
+    eco_low_power_mode: bool = False
+    dns_architecture: str = "split_horizon"
+    backup_remote_dns: str = "https://dns.google/dns-query"
+    bootstrap_dns_server: str = "1.1.1.1"
+    dns_hijack_port53: bool = True
+    dns_disable_fallback_if_match: bool = True
+    dns_client_ip: str = ""
+    fake_dns_pool_size: int = 65535
+    custom_dns_hosts: str = "cloudflare-dns.com=1.1.1.1\ndns.google=8.8.8.8"
+    watchdog_enabled: bool = True
+    watchdog_interval_sec: int = 25
+    watchdog_auto_heal: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -435,7 +483,8 @@ class ProfileNode:
             normalized["original_host"] = str(fallback_host)
         valid_keys = {f.name for f in cls.__dataclass_fields__.values()}
         filtered = {k: v for k, v in normalized.items() if k in valid_keys}
-        return cls(**filtered)
+        return cls(
+**filtered)
 
 
 @dataclass

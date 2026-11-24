@@ -1701,6 +1701,7 @@ class ConfigsPage(QWidget):
         self.btn_upd_all_subs = ActionPillButton("refresh", I18N.t("btn_update_all_subs"), variant="emerald")
         self.btn_upd_all_subs.clicked.connect(self._on_refresh_all_subs)
 
+
         self.btn_new = ActionPillButton("edit", I18N.t("new_config_btn"), variant="ghost")
         self.btn_new.clicked.connect(self._request_new_in_group)
 
@@ -2052,6 +2053,10 @@ class ConfigsPage(QWidget):
         if 0 <= row < len(self._visible_rows):
             orig_idx, uid, _ = self._visible_rows[row]
             self.select_active_requested.emit(uid if uid else orig_idx)
+
+
+
+
 
     def _on_refresh_this_sub(self) -> None:
         grp = self.active_import_group()
@@ -3076,6 +3081,13 @@ class LabPage(QWidget):
 
 
 class RoutingSettingsPage(QWidget):
+    pro_hot_reload_requested = Signal(dict)
+    dns_benchmark_requested = Signal()
+    dns_benchmark_finished = Signal(str, str)
+    dns_flush_requested = Signal()
+    pro_settings_saved = Signal(dict)
+    hw_trim_ram_requested = Signal()
+    hw_refresh_stats_requested = Signal()
     settings_changed = Signal(dict)
     setting_key_changed = Signal(str, object)
     discover_apps_requested = Signal()
@@ -3130,6 +3142,7 @@ class RoutingSettingsPage(QWidget):
         self.stack.addWidget(self._build_behavior_tab())
         self.stack.addWidget(self._build_core_tab())
         _auto_justify_button_bars(self)
+        _attach_pro_network_settings_hub(self)
 
     def _build_routing_tab(self) -> QWidget:
         host = QWidget()
@@ -3973,6 +3986,262 @@ class RoutingSettingsPage(QWidget):
             b.set_palette_theme(palette)
         self._render_app_table()
 
+    def _on_dns_benchmark_finished_ui(self, best_dns: str, summary: str) -> None:
+        if hasattr(self, "btn_dns_bench"):
+            self.btn_dns_bench.setEnabled(True)
+        if best_dns and hasattr(self, "pro_remote_dns"):
+            self.pro_remote_dns.setCurrentText(str(best_dns))
+        if hasattr(self, "dns_lab_status"):
+            self.dns_lab_status.setText(_rtl_mix(summary))
+
+    def _apply_pro_preset(self, preset: str, auto_save: bool = False) -> None:
+        if preset == "lowram":
+            cfg = {
+                "xray_log_level": "none",
+                "block_quic_udp443": True,
+                "mux_enabled": False,
+                "dns_architecture": "split_horizon",
+                "fake_dns_enabled": False,
+                "xray_mem_limit_mb": 36,
+                "xray_gogc_percent": 25,
+                "xray_policy_buffer_kb": 64,
+                "xray_conn_idle_sec": 90,
+                "socket_rcvbuf_kb": 128,
+                "socket_sndbuf_kb": 64,
+                "max_log_lines": 150,
+                "tray_ram_trim_enabled": True,
+                "eco_low_power_mode": True,
+                "watchdog_enabled": False,
+            }
+            lbl = "پروفایل «فوق‌سبک و کم‌مصرف» ذخیره و اعمال شد."
+        elif preset == "gaming":
+            cfg = {
+                "xray_log_level": "error",
+                "block_quic_udp443": True,
+                "dns_architecture": "fakedns_turbo",
+                "fake_dns_enabled": True,
+                "dns_hijack_port53": True,
+                "tcp_nodelay_enabled": True,
+                "tcp_fast_open": True,
+                "tcp_keepalive_sec": 20,
+                "socket_rcvbuf_kb": 512,
+                "socket_sndbuf_kb": 192,
+                "xray_mem_limit_mb": 128,
+                "xray_gogc_percent": 80,
+                "xray_policy_buffer_kb": 256,
+                "xray_conn_idle_sec": 240,
+                "eco_low_power_mode": False,
+                "watchdog_enabled": True,
+                "watchdog_interval_sec": 15,
+                "watchdog_auto_heal": True,
+            }
+            lbl = "پروفایل «نهایت سرعت و گیمینگ (FakeDNS Turbo)» ذخیره و اعمال شد."
+        else:
+            cfg = {
+                "allow_lan": False,
+                "block_quic_udp443": True,
+                "sniffing_enabled": True,
+                "sniffing_route_only": False,
+                "xray_log_level": "error",
+                "tls_fingerprint_override": "keep",
+                "tls_alpn_override": "keep",
+                "allow_insecure_tls": False,
+                "mux_enabled": False,
+                "mux_concurrency": 8,
+                "watchdog_enabled": True,
+                "watchdog_interval_sec": 25,
+                "watchdog_auto_heal": True,
+                "dns_architecture": "split_horizon",
+                "dns_query_strategy": "UseIPv4",
+                "remote_dns_server": "https://1.1.1.1/dns-query",
+                "backup_remote_dns": "https://dns.google/dns-query",
+                "direct_dns_server": "178.22.122.100",
+                "bootstrap_dns_server": "1.1.1.1",
+                "dns_hijack_port53": True,
+                "fake_dns_enabled": False,
+                "dns_disable_fallback": True,
+                "dns_disable_fallback_if_match": True,
+                "dns_disable_cache": False,
+                "dns_client_ip": "",
+                "fake_dns_pool_size": 65535,
+                "routing_domain_strategy": "IPIfNonMatch",
+                "block_ads_malware": True,
+                "bypass_lan_private": True,
+                "tun_mtu": 1360,
+                "tcp_nodelay_enabled": True,
+                "tcp_fast_open": False,
+                "tcp_keepalive_sec": 30,
+                "tcp_maxseg_override": 1220,
+                "socket_rcvbuf_kb": 256,
+                "socket_sndbuf_kb": 96,
+                "xray_fragment_enabled": False,
+                "xray_mem_limit_mb": 48,
+                "xray_gogc_percent": 40,
+                "xray_policy_buffer_kb": 128,
+                "xray_conn_idle_sec": 180,
+                "max_log_lines": 250,
+                "tray_ram_trim_enabled": True,
+                "eco_low_power_mode": False,
+            }
+            lbl = "پروفایل «تعادل و بهینه» ذخیره و اعمال شد."
+
+        self.load_pro_settings(cfg)
+        if auto_save:
+            self._emit_pro_settings_save(custom_msg=lbl, hot_reload=False)
+
+    def _emit_pro_settings_save(self, custom_msg: str = "", hot_reload: bool = False) -> None:
+        if not hasattr(self, "pro_tabs"):
+            return
+        payload = {
+            "allow_lan": bool(self.pro_allow_lan.isChecked()),
+            "block_quic_udp443": bool(self.pro_block_quic.isChecked()),
+            "sniffing_enabled": bool(self.pro_sniff_on.isChecked()),
+            "sniffing_route_only": bool(self.pro_sniff_ro.isChecked()),
+            "xray_log_level": str(self.pro_log_combo.currentData() or "error"),
+            "tls_fingerprint_override": str(self.pro_fp_combo.currentData() or "keep"),
+            "tls_alpn_override": str(self.pro_alpn_combo.currentData() or "keep"),
+            "allow_insecure_tls": bool(self.pro_allow_insecure.isChecked()),
+            "mux_enabled": bool(self.pro_mux_on.isChecked()),
+            "mux_concurrency": int(self.pro_mux_conc.value()),
+            "watchdog_enabled": bool(self.pro_wd_on.isChecked()),
+            "watchdog_interval_sec": int(self.pro_wd_interval.value()),
+            "watchdog_auto_heal": bool(self.pro_wd_heal.isChecked()),
+            "dns_architecture": str(self.pro_dns_arch.currentData() or "split_horizon"),
+            "dns_query_strategy": str(self.pro_dns_strat.currentData() or "UseIPv4"),
+            "remote_dns_server": str(self.pro_remote_dns.currentText() or "https://1.1.1.1/dns-query").strip(),
+            "backup_remote_dns": str(self.pro_backup_dns.currentText() or "").strip(),
+            "direct_dns_server": str(self.pro_direct_dns.currentText() or "178.22.122.100").strip(),
+            "bootstrap_dns_server": str(self.pro_boot_dns.text() or "1.1.1.1").strip(),
+            "dns_hijack_port53": bool(self.pro_dns_hijack53.isChecked()),
+            "fake_dns_enabled": bool(self.pro_fakedns_chk.isChecked()),
+            "dns_disable_fallback": bool(self.pro_dns_nofb_chk.isChecked()),
+            "dns_disable_fallback_if_match": bool(self.pro_dns_nofb_match.isChecked()),
+            "dns_disable_cache": bool(self.pro_dns_nocache_chk.isChecked()),
+            "dns_client_ip": str(self.pro_edns_ip.text() or "").strip(),
+            "fake_dns_pool_size": int(self.pro_fakedns_pool.value()),
+            "custom_dns_hosts": str(self.pro_dns_hosts.toPlainText() or "").strip(),
+            "routing_domain_strategy": str(self.pro_route_strat.currentData() or "IPIfNonMatch"),
+            "block_ads_malware": bool(self.pro_block_ads.isChecked()),
+            "bypass_lan_private": bool(self.pro_bypass_lan.isChecked()),
+            "custom_proxy_rules": str(self.pro_proxy_rules.toPlainText() or "").strip(),
+            "custom_direct_rules": str(self.pro_direct_rules.toPlainText() or "").strip(),
+            "custom_block_rules": str(self.pro_block_rules.toPlainText() or "").strip(),
+            "tun_mtu": int(self.pro_tun_mtu.value()),
+            "tcp_nodelay_enabled": bool(self.pro_nodelay_chk.isChecked()),
+            "tcp_fast_open": bool(self.pro_tfo_chk.isChecked()),
+            "tcp_keepalive_sec": int(self.pro_keepalive_sec.value()),
+            "tcp_maxseg_override": int(self.pro_tcp_mss.value()),
+            "socket_rcvbuf_kb": int(self.pro_rcvbuf_kb.value()),
+            "socket_sndbuf_kb": int(self.pro_sndbuf_kb.value()),
+            "xray_fragment_enabled": bool(self.pro_frag_chk.isChecked()),
+            "xray_fragment_packets": str(self.pro_frag_pkts.currentText() or "tlshello").strip(),
+            "xray_fragment_length": str(self.pro_frag_len.text() or "10-30").strip(),
+            "xray_fragment_interval": str(self.pro_frag_int.text() or "5-15").strip(),
+            "xray_mem_limit_mb": int(self.pro_mem_limit.value()),
+            "xray_gogc_percent": int(self.pro_gogc.value()),
+            "xray_policy_buffer_kb": int(self.pro_pol_buf.value()),
+            "xray_conn_idle_sec": int(self.pro_idle_reaper.value()),
+            "max_log_lines": int(self.pro_max_logs.value()),
+            "tray_ram_trim_enabled": bool(self.pro_tray_trim.isChecked()),
+            "eco_low_power_mode": bool(self.pro_eco_mode.isChecked()),
+        }
+        if hot_reload:
+            self.pro_hot_reload_requested.emit(payload)
+            msg = custom_msg or "تنظیمات ذخیره شد و اتصال فعال در حال اعمال فوری (Hot-Reload) است..."
+        else:
+            self.pro_settings_saved.emit(payload)
+            msg = custom_msg or "تمام تنظیمات مهندسی شبکه، آزمایشگاه DNS و سخت‌افزار با موفقیت ذخیره شد."
+        self.pro_status_lbl.setStyleSheet("color: #34D399; font-size: 11px; font-weight: 600;")
+        self.pro_status_lbl.setText(_rtl_mix(msg))
+
+    def load_pro_settings(self, s: dict) -> None:
+        if not hasattr(self, "pro_tabs") or not isinstance(s, dict):
+            return
+        def _set_cb(cb, key, default_v):
+            if key in s:
+                idx = cb.findData(str(s.get(key) if s.get(key) is not None else default_v))
+                if idx >= 0:
+                    cb.setCurrentIndex(idx)
+
+        if "allow_lan" in s: self.pro_allow_lan.setChecked(bool(s["allow_lan"]))
+        if "block_quic_udp443" in s: self.pro_block_quic.setChecked(bool(s["block_quic_udp443"]))
+        if "sniffing_enabled" in s: self.pro_sniff_on.setChecked(bool(s["sniffing_enabled"]))
+        if "sniffing_route_only" in s: self.pro_sniff_ro.setChecked(bool(s["sniffing_route_only"]))
+        if "allow_insecure_tls" in s: self.pro_allow_insecure.setChecked(bool(s["allow_insecure_tls"]))
+        if "mux_enabled" in s: self.pro_mux_on.setChecked(bool(s["mux_enabled"]))
+        if "mux_concurrency" in s: self.pro_mux_conc.setValue(int(s["mux_concurrency"] or 8))
+        if "watchdog_enabled" in s: self.pro_wd_on.setChecked(bool(s["watchdog_enabled"]))
+        if "watchdog_interval_sec" in s: self.pro_wd_interval.setValue(int(s["watchdog_interval_sec"] or 25))
+        if "watchdog_auto_heal" in s: self.pro_wd_heal.setChecked(bool(s["watchdog_auto_heal"]))
+        _set_cb(self.pro_fp_combo, "tls_fingerprint_override", "keep")
+        _set_cb(self.pro_alpn_combo, "tls_alpn_override", "keep")
+        _set_cb(self.pro_log_combo, "xray_log_level", "error")
+
+        _set_cb(self.pro_dns_arch, "dns_architecture", "split_horizon")
+        _set_cb(self.pro_dns_strat, "dns_query_strategy", "UseIPv4")
+        if "remote_dns_server" in s: self.pro_remote_dns.setCurrentText(str(s["remote_dns_server"] or "https://1.1.1.1/dns-query"))
+        if "backup_remote_dns" in s: self.pro_backup_dns.setCurrentText(str(s["backup_remote_dns"] or ""))
+        if "direct_dns_server" in s: self.pro_direct_dns.setCurrentText(str(s["direct_dns_server"] or "178.22.122.100"))
+        if "bootstrap_dns_server" in s: self.pro_boot_dns.setText(str(s["bootstrap_dns_server"] or "1.1.1.1"))
+        if "dns_hijack_port53" in s: self.pro_dns_hijack53.setChecked(bool(s["dns_hijack_port53"]))
+        if "fake_dns_enabled" in s: self.pro_fakedns_chk.setChecked(bool(s["fake_dns_enabled"]))
+        if "dns_disable_fallback" in s: self.pro_dns_nofb_chk.setChecked(bool(s["dns_disable_fallback"]))
+        if "dns_disable_fallback_if_match" in s: self.pro_dns_nofb_match.setChecked(bool(s["dns_disable_fallback_if_match"]))
+        if "dns_disable_cache" in s: self.pro_dns_nocache_chk.setChecked(bool(s["dns_disable_cache"]))
+        if "dns_client_ip" in s: self.pro_edns_ip.setText(str(s["dns_client_ip"] or ""))
+        if "fake_dns_pool_size" in s: self.pro_fakedns_pool.setValue(int(s["fake_dns_pool_size"] or 65535))
+        if "custom_dns_hosts" in s: self.pro_dns_hosts.setPlainText(str(s["custom_dns_hosts"] or ""))
+
+        _set_cb(self.pro_route_strat, "routing_domain_strategy", "IPIfNonMatch")
+        if "block_ads_malware" in s: self.pro_block_ads.setChecked(bool(s["block_ads_malware"]))
+        if "bypass_lan_private" in s: self.pro_bypass_lan.setChecked(bool(s["bypass_lan_private"]))
+        if "custom_proxy_rules" in s: self.pro_proxy_rules.setPlainText(str(s["custom_proxy_rules"] or ""))
+        if "custom_direct_rules" in s: self.pro_direct_rules.setPlainText(str(s["custom_direct_rules"] or ""))
+        if "custom_block_rules" in s: self.pro_block_rules.setPlainText(str(s["custom_block_rules"] or ""))
+
+        if "tun_mtu" in s: self.pro_tun_mtu.setValue(int(s["tun_mtu"] or 1360))
+        if "tcp_maxseg_override" in s: self.pro_tcp_mss.setValue(int(s["tcp_maxseg_override"] if s["tcp_maxseg_override"] is not None else 1220))
+        if "socket_rcvbuf_kb" in s: self.pro_rcvbuf_kb.setValue(int(s["socket_rcvbuf_kb"] or 256))
+        if "socket_sndbuf_kb" in s: self.pro_sndbuf_kb.setValue(int(s["socket_sndbuf_kb"] or 96))
+        if "tcp_keepalive_sec" in s: self.pro_keepalive_sec.setValue(int(s["tcp_keepalive_sec"] if s["tcp_keepalive_sec"] is not None else 30))
+        if "tcp_nodelay_enabled" in s: self.pro_nodelay_chk.setChecked(bool(s["tcp_nodelay_enabled"]))
+        if "tcp_fast_open" in s: self.pro_tfo_chk.setChecked(bool(s["tcp_fast_open"]))
+        if "xray_fragment_enabled" in s: self.pro_frag_chk.setChecked(bool(s["xray_fragment_enabled"]))
+        if "xray_fragment_packets" in s: self.pro_frag_pkts.setCurrentText(str(s["xray_fragment_packets"] or "tlshello"))
+        if "xray_fragment_length" in s: self.pro_frag_len.setText(str(s["xray_fragment_length"] or "10-30"))
+        if "xray_fragment_interval" in s: self.pro_frag_int.setText(str(s["xray_fragment_interval"] or "5-15"))
+
+        if "xray_mem_limit_mb" in s: self.pro_mem_limit.setValue(int(s["xray_mem_limit_mb"] or 48))
+        if "xray_gogc_percent" in s: self.pro_gogc.setValue(int(s["xray_gogc_percent"] or 40))
+        if "xray_policy_buffer_kb" in s: self.pro_pol_buf.setValue(int(s["xray_policy_buffer_kb"] or 128))
+        if "xray_conn_idle_sec" in s: self.pro_idle_reaper.setValue(int(s["xray_conn_idle_sec"] or 180))
+        if "max_log_lines" in s: self.pro_max_logs.setValue(int(s["max_log_lines"] or 250))
+        if "tray_ram_trim_enabled" in s: self.pro_tray_trim.setChecked(bool(s["tray_ram_trim_enabled"]))
+        if "eco_low_power_mode" in s: self.pro_eco_mode.setChecked(bool(s["eco_low_power_mode"]))
+
+    def update_hardware_badge(self, info: dict) -> None:
+        if not hasattr(self, "hw_live_badge") or not isinstance(info, dict):
+            return
+        py_mb = info.get("python_mb", 0.0)
+        xr_mb = info.get("xray_mb", 0.0)
+        tot = info.get("total_mb", 0.0)
+        thr = info.get("threads", 0)
+        freed = info.get("freed_mb", 0.0)
+        extra = f"  |  آزاد شد: {freed} MB" if freed and freed > 0 else ""
+        self.hw_live_badge.setText(_rtl_mix(
+            f"مصرف زنده RAM  —  رابط کاربری: {py_mb} MB  |  هسته Xray: {xr_mb} MB  |  مجموع: {tot} MB  |  تردها: {thr}{extra}"
+        ))
+
+
+
+
+
+
+
+
+
+
+
 
 class LogsPage(QWidget):
     def __init__(self, parent=None):
@@ -4126,7 +4395,7 @@ class AboutPage(QWidget):
         t_line.setSpacing(10)
         self.title_lbl = QLabel("Alan-RIP-Dpi")
         self.title_lbl.setObjectName("PageTitle")
-        self.ver_pill = QLabel("v1.5.0")
+        self.ver_pill = QLabel("v1.6.0")
         self.ver_pill.setObjectName("EmeraldPill")
         enforce_english_ltr(self.ver_pill, mono_size=10, bold=True)
         t_line.addWidget(self.title_lbl)
@@ -4238,7 +4507,7 @@ class AboutPage(QWidget):
         self.btn_check_upd.setEnabled(True)
         if not isinstance(info, dict):
             return
-        cur_v = str(info.get("current_version") or "1.5.0")
+        cur_v = str(info.get("current_version") or "1.6.0")
         lat_v = str(info.get("latest_version") or cur_v)
         self.ver_pill.setText(f"v{cur_v}")
 
@@ -4637,3 +4906,679 @@ def _reorganize_configs_page_toolbars(page) -> None:
 
     skip_w = set(sub_btns) | set(maint_btns) | ({search_edit} if search_edit is not None else set())
     _auto_justify_button_bars(page, skip_widgets=skip_w)
+
+
+def _rtl_mix(text: str) -> str:
+    """Adds Unicode RLM so Persian+English strings render in natural RTL order without flipped parens."""
+    return "\u200f" + str(text or "")
+
+
+def _attach_pro_network_settings_hub(page) -> None:
+    """
+    Redesigned Liquid-Glass / Dark-Charcoal & Gold 5-Tab Pro NetOps & Super DNS Lab Hub:
+      - Zero BiDi/RTL text scrambling
+      - Custom glass checkboxes (no harsh yellow defaults)
+      - Cohesive dark glass ComboBox / SpinBox / LineEdit / LTR rule editors with slim gold scrollbars
+      - Full Super DNS Lab (3 architectures, DoH/DoT/Backup/Direct/Bootstrap, Port-53 Hijack,
+        EDNS clientIp, Static DNS Hosts, Live DNS Benchmark + 10.10.34.x Poisoning Detector & Flush DNS)
+      - Connection Watchdog & Auto-Heal + One-Click Save & Hot-Reload
+    """
+    if hasattr(page, "pro_tabs"):
+        return
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import (
+        QCheckBox,
+        QComboBox,
+        QFrame,
+        QGridLayout,
+        QHBoxLayout,
+        QLabel,
+        QLineEdit,
+        QPlainTextEdit,
+        QScrollArea,
+        QSizePolicy,
+        QSpinBox,
+        QTabWidget,
+        QVBoxLayout,
+        QWidget,
+    )
+
+    target_v = None
+    for sa in page.findChildren(QScrollArea):
+        inner = sa.widget()
+        if inner is not None and isinstance(inner.layout(), QVBoxLayout):
+            target_v = inner.layout()
+            break
+    if target_v is None and isinstance(page.layout(), QVBoxLayout):
+        target_v = page.layout()
+    if target_v is None:
+        return
+
+    card = NeuCard(page)
+    card.setObjectName("ProNetOpsHubCard")
+    card.setStyleSheet("""
+        QWidget#ProNetOpsHubCard QLabel {
+            color: #E5E7EB;
+            font-size: 12px;
+            background: transparent;
+        }
+        QWidget#ProNetOpsHubCard QFrame#GlassSubPanel {
+            background: rgba(10, 13, 19, 0.52);
+            border: 1px solid rgba(255, 255, 255, 0.07);
+            border-radius: 12px;
+        }
+        QWidget#ProNetOpsHubCard QLabel#SubPanelHeader {
+            color: #F5D06B;
+            font-size: 12px;
+            font-weight: 700;
+            padding-bottom: 2px;
+        }
+        QWidget#ProNetOpsHubCard QComboBox,
+        QWidget#ProNetOpsHubCard QSpinBox,
+        QWidget#ProNetOpsHubCard QLineEdit {
+            background: rgba(14, 18, 26, 0.85);
+            color: #F3F4F6;
+            border: 1px solid rgba(255, 255, 255, 0.11);
+            border-radius: 10px;
+            padding: 6px 10px;
+            min-height: 22px;
+            font-size: 12px;
+        }
+        QWidget#ProNetOpsHubCard QComboBox:hover,
+        QWidget#ProNetOpsHubCard QSpinBox:hover,
+        QWidget#ProNetOpsHubCard QLineEdit:hover {
+            border: 1px solid rgba(245, 208, 107, 0.35);
+            background: rgba(18, 23, 33, 0.92);
+        }
+        QWidget#ProNetOpsHubCard QComboBox:focus,
+        QWidget#ProNetOpsHubCard QSpinBox:focus,
+        QWidget#ProNetOpsHubCard QLineEdit:focus {
+            border: 1px solid rgba(245, 208, 107, 0.72);
+        }
+        QWidget#ProNetOpsHubCard QComboBox::drop-down {
+            border: none;
+            width: 24px;
+        }
+        QWidget#ProNetOpsHubCard QComboBox QAbstractItemView {
+            background: #121620;
+            color: #F3F4F6;
+            border: 1px solid rgba(245, 208, 107, 0.35);
+            border-radius: 8px;
+            selection-background-color: rgba(245, 208, 107, 0.22);
+            selection-color: #F5D06B;
+            padding: 4px;
+        }
+        QWidget#ProNetOpsHubCard QPlainTextEdit {
+            background: rgba(10, 13, 19, 0.88);
+            color: #E5E7EB;
+            border: 1px solid rgba(255, 255, 255, 0.10);
+            border-radius: 10px;
+            padding: 7px 10px;
+            font-family: "Consolas", "Cascadia Mono", monospace;
+            font-size: 11.5px;
+        }
+        QWidget#ProNetOpsHubCard QPlainTextEdit:focus {
+            border: 1px solid rgba(245, 208, 107, 0.65);
+        }
+        QWidget#ProNetOpsHubCard QCheckBox {
+            color: #E5E7EB;
+            spacing: 9px;
+            font-size: 12px;
+            padding: 3px 2px;
+            background: transparent;
+        }
+        QWidget#ProNetOpsHubCard QCheckBox::indicator {
+            width: 17px;
+            height: 17px;
+            border-radius: 6px;
+            border: 1px solid rgba(255, 255, 255, 0.22);
+            background: rgba(15, 19, 28, 0.88);
+        }
+        QWidget#ProNetOpsHubCard QCheckBox::indicator:hover {
+            border: 1px solid rgba(245, 208, 107, 0.60);
+        }
+        QWidget#ProNetOpsHubCard QCheckBox::indicator:checked {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #D4AF37, stop:1 #F5D06B);
+            border: 1px solid #F5D06B;
+        }
+        QWidget#ProNetOpsHubCard QScrollBar:vertical {
+            background: transparent;
+            width: 5px;
+            margin: 3px 1px;
+        }
+        QWidget#ProNetOpsHubCard QScrollBar::handle:vertical {
+            background: rgba(245, 208, 107, 0.35);
+            border-radius: 2px;
+            min-height: 18px;
+        }
+        QWidget#ProNetOpsHubCard QScrollBar::add-line:vertical,
+        QWidget#ProNetOpsHubCard QScrollBar::sub-line:vertical {
+            height: 0px;
+        }
+    """)
+
+    cv = QVBoxLayout(card)
+    cv.setContentsMargins(18, 16, 18, 18)
+    cv.setSpacing(14)
+
+    # Header + Uniform 3-Preset Bar
+    hdr_row = QHBoxLayout()
+    hdr_row.setSpacing(10)
+    hdr_col = QVBoxLayout()
+    hdr_col.setSpacing(3)
+    hdr = QLabel(_rtl_mix("مرکز مهندسی شبکه، آزمایشگاه DNS و بهینه‌سازی سخت‌افزار"))
+    hdr.setObjectName("SectionTitle")
+    hdr.setStyleSheet("font-size: 15px; font-weight: 800; color: #F5D06B;")
+    sub = QLabel(_rtl_mix(
+        "کنترل کامل هسته Xray، معماری DNS ضد مسمومیت، فایروال، سوکت‌های لایه ۴، نگهبان اتصال و مدیریت زنده RAM"
+    ))
+    sub.setWordWrap(True)
+    sub.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+    hdr_col.addWidget(hdr)
+    hdr_col.addWidget(sub)
+    hdr_row.addLayout(hdr_col, 1)
+    cv.addLayout(hdr_row)
+
+    preset_bar = QHBoxLayout()
+    preset_bar.setSpacing(10)
+    page.btn_preset_balanced = ActionPillButton("spark", "پروفایل تعادل", variant="ghost")
+    page.btn_preset_lowram = ActionPillButton("check", "فوق‌سبک و کم‌مصرف", variant="emerald")
+    page.btn_preset_gaming = ActionPillButton("refresh", "نهایت سرعت و گیمینگ", variant="amber")
+    for b in (page.btn_preset_balanced, page.btn_preset_lowram, page.btn_preset_gaming):
+        b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        preset_bar.addWidget(b, 1)
+    cv.addLayout(preset_bar)
+
+    # Helper to build cohesive Glass Sub-Panels inside each tab
+    def _make_panel(title_text: str):
+        fr = QFrame()
+        fr.setObjectName("GlassSubPanel")
+        pv = QVBoxLayout(fr)
+        pv.setContentsMargins(14, 12, 14, 12)
+        pv.setSpacing(9)
+        tl = QLabel(_rtl_mix(title_text))
+        tl.setObjectName("SubPanelHeader")
+        pv.addWidget(tl)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(9)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        pv.addLayout(grid)
+        return fr, grid
+
+    def _lbl(t: str) -> QLabel:
+        lb = QLabel(_rtl_mix(t))
+        lb.setStyleSheet("color: #CBD5E1; font-size: 11.5px; font-weight: 600;")
+        return lb
+
+    def _ltr_edit(placeholder: str, height: int = 58) -> QPlainTextEdit:
+        ed = QPlainTextEdit()
+        ed.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+        ed.setPlaceholderText(placeholder)
+        ed.setFixedHeight(height)
+        return ed
+
+    # 5-Tab Segmented Glass Bar (Clean RTL tab labels — zero BiDi inversion!)
+    tabs = QTabWidget(card)
+    page.pro_tabs = tabs
+    tabs.setDocumentMode(True)
+    tabs.tabBar().setExpanding(True)
+    tabs.setStyleSheet("""
+        QTabWidget::pane {
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 14px;
+            background: rgba(13, 17, 24, 0.56);
+            padding: 12px;
+            margin-top: 8px;
+        }
+        QTabBar::tab {
+            background: rgba(255, 255, 255, 0.035);
+            color: #9CA3AF;
+            padding: 9px 12px;
+            margin: 0px 3px;
+            border: 1px solid rgba(255, 255, 255, 0.06);
+            border-radius: 10px;
+            font-weight: 700;
+            font-size: 11.5px;
+        }
+        QTabBar::tab:selected {
+            background: rgba(245, 208, 107, 0.14);
+            color: #F5D06B;
+            border: 1px solid rgba(245, 208, 107, 0.52);
+        }
+        QTabBar::tab:hover:!selected {
+            color: #F3F4F6;
+            background: rgba(255, 255, 255, 0.07);
+        }
+    """)
+
+    # ================= TAB 1: Core, TLS, Mux & Watchdog =================
+    tab_core = QWidget()
+    v1 = QVBoxLayout(tab_core)
+    v1.setContentsMargins(4, 4, 4, 4)
+    v1.setSpacing(10)
+
+    p1a, g1a = _make_panel("پروتکل هسته، شبکه‌محلی و امنیت TLS")
+    page.pro_allow_lan = QCheckBox(_rtl_mix("اشتراک‌گذاری پروکسی روی شبکه محلی (Allow LAN)"))
+    page.pro_block_quic = QCheckBox(_rtl_mix("مسدودسازی QUIC پورت ۴۴۳ (ضد افت سرعت مرورگر)"))
+    page.pro_sniff_on = QCheckBox(_rtl_mix("فعال‌سازی Sniffing عمیق بسته‌های HTTP و TLS"))
+    page.pro_sniff_ro = QCheckBox(_rtl_mix("استفاده از Sniffing فقط برای مسیریابی"))
+    page.pro_allow_insecure = QCheckBox(_rtl_mix("پذیرش گواهی TLS بدون اعتبارسنجی (AllowInsecure)"))
+
+    page.pro_fp_combo = QComboBox()
+    for lbl, val in (
+        ("حفظ اثرانگشت خود کانفیگ", "keep"),
+        ("شبیه‌ساز کروم — Chrome", "chrome"),
+        ("شبیه‌ساز فایرفاکس — Firefox", "firefox"),
+        ("شبیه‌ساز سافاری — Safari", "safari"),
+        ("شبیه‌ساز آیفون — iOS", "ios"),
+        ("شبیه‌ساز اندروید — Android", "android"),
+        ("شبیه‌ساز اج — Edge", "edge"),
+        ("تصادفی هوشمند — Randomized", "randomized"),
+    ):
+        page.pro_fp_combo.addItem(_rtl_mix(lbl), val)
+
+    page.pro_alpn_combo = QComboBox()
+    for lbl, val in (
+        ("حفظ ALPN خود کانفیگ", "keep"),
+        ("استاندارد ترکیبی — h2, http/1.1", "h2,http/1.1"),
+        ("فقط HTTP/1.1 (پایدار روی CDNها)", "http/1.1"),
+        ("فقط HTTP/2 (h2)", "h2"),
+    ):
+        page.pro_alpn_combo.addItem(_rtl_mix(lbl), val)
+
+    page.pro_log_combo = QComboBox()
+    for lbl, val in (
+        ("فقط خطاهای حیاتی — کمترین CPU", "error"),
+        ("کاملاً خاموش — بیشترین سرعت", "none"),
+        ("هشدارها و خطاها — Warning", "warning"),
+        ("ثبت کامل جزئیات — Info", "info"),
+    ):
+        page.pro_log_combo.addItem(_rtl_mix(lbl), val)
+
+    g1a.addWidget(page.pro_allow_lan, 0, 0, 1, 2)
+    g1a.addWidget(page.pro_block_quic, 0, 2, 1, 2)
+    g1a.addWidget(page.pro_sniff_on, 1, 0, 1, 2)
+    g1a.addWidget(page.pro_sniff_ro, 1, 2, 1, 2)
+    g1a.addWidget(_lbl("جعل اثرانگشت uTLS:"), 2, 0)
+    g1a.addWidget(page.pro_fp_combo, 2, 1)
+    g1a.addWidget(_lbl("پروتکل ALPN:"), 2, 2)
+    g1a.addWidget(page.pro_alpn_combo, 2, 3)
+    g1a.addWidget(_lbl("سطح لاگ هسته:"), 3, 0)
+    g1a.addWidget(page.pro_log_combo, 3, 1)
+    g1a.addWidget(page.pro_allow_insecure, 3, 2, 1, 2)
+    v1.addWidget(p1a)
+
+    p1b, g1b = _make_panel("مالتی‌پلکسینگ (Mux.Cool) و نگهبان زنده اتصال (Watchdog)")
+    page.pro_mux_on = QCheckBox(_rtl_mix("فعال‌سازی Mux.Cool (غیرفعال خودکار روی XTLS-Vision)"))
+    page.pro_mux_conc = QSpinBox()
+    page.pro_mux_conc.setRange(1, 32)
+    page.pro_mux_conc.setValue(8)
+
+    page.pro_wd_on = QCheckBox(_rtl_mix("نگهبان زنده اتصال (پایش قطعی خاموش تونل)"))
+    page.pro_wd_heal = QCheckBox(_rtl_mix("ترمیم و اتصال مجدد خودکار هنگام افت خط"))
+    page.pro_wd_interval = QSpinBox()
+    page.pro_wd_interval.setRange(10, 120)
+    page.pro_wd_interval.setSuffix(" ثانیه")
+    page.pro_wd_interval.setValue(25)
+
+    g1b.addWidget(page.pro_mux_on, 0, 0, 1, 2)
+    g1b.addWidget(_lbl("ظرفیت هم‌زمان Mux:"), 0, 2)
+    g1b.addWidget(page.pro_mux_conc, 0, 3)
+    g1b.addWidget(page.pro_wd_on, 1, 0, 1, 2)
+    g1b.addWidget(_lbl("بازه بررسی سلامت:"), 1, 2)
+    g1b.addWidget(page.pro_wd_interval, 1, 3)
+    g1b.addWidget(page.pro_wd_heal, 2, 0, 1, 4)
+    v1.addWidget(p1b)
+    v1.addStretch(1)
+    tabs.addTab(tab_core, "هسته و پروتکل")
+
+    # ================= TAB 2: SUPER DNS LAB =================
+    tab_dns = QWidget()
+    v2 = QVBoxLayout(tab_dns)
+    v2.setContentsMargins(4, 4, 4, 4)
+    v2.setSpacing(10)
+
+    p2a, g2a = _make_panel("معماری و سرورهای رمزنگاری‌شده DNS (ضد مسمومیت و ضد نشت)")
+    page.pro_dns_arch = QComboBox()
+    for lbl, val in (
+        ("هوشمند دوگانه — Split-Horizon (پیشنهادی ایران)", "split_horizon"),
+        ("ضد نشت ۱۰۰٪ — تمام DNS داخل تونل (Zero-Leak)", "zero_leak"),
+        ("توربو گیمینگ و TUN — FakeDNS (تاخیر صفر)", "fakedns_turbo"),
+    ):
+        page.pro_dns_arch.addItem(_rtl_mix(lbl), val)
+
+    page.pro_dns_strat = QComboBox()
+    for lbl, val in (
+        ("فقط IPv4 — پایدارترین حالت", "UseIPv4"),
+        ("دوگانه IPv4 + IPv6", "UseIP"),
+        ("فقط IPv6", "UseIPv6"),
+    ):
+        page.pro_dns_strat.addItem(_rtl_mix(lbl), val)
+
+    page.pro_remote_dns = QComboBox()
+    page.pro_remote_dns.setEditable(True)
+    page.pro_remote_dns.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    for d in (
+        "https://1.1.1.1/dns-query",
+        "https+local://1.1.1.1/dns-query",
+        "https://dns.google/dns-query",
+        "https://dns.quad9.net/dns-query",
+        "https://dns.adguard-dns.com/dns-query",
+        "https://freedns.controld.com/p0",
+        "tls://1.1.1.1",
+        "tls://8.8.8.8",
+        "1.1.1.1",
+        "8.8.8.8",
+    ):
+        page.pro_remote_dns.addItem(d)
+
+    page.pro_backup_dns = QComboBox()
+    page.pro_backup_dns.setEditable(True)
+    page.pro_backup_dns.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    for d in (
+        "https://dns.google/dns-query",
+        "https://dns.quad9.net/dns-query",
+        "https://1.1.1.1/dns-query",
+        "8.8.8.8",
+        "9.9.9.9",
+        "",
+    ):
+        page.pro_backup_dns.addItem(d)
+
+    page.pro_direct_dns = QComboBox()
+    page.pro_direct_dns.setEditable(True)
+    page.pro_direct_dns.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    for d in ("178.22.122.100", "185.51.200.2", "10.202.10.202", "78.157.42.100", "10.202.10.10", "localhost"):
+        page.pro_direct_dns.addItem(d)
+
+    page.pro_boot_dns = QLineEdit("1.1.1.1")
+    page.pro_boot_dns.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    page.pro_boot_dns.setPlaceholderText("1.1.1.1")
+
+    g2a.addWidget(_lbl("معماری DNS:"), 0, 0)
+    g2a.addWidget(page.pro_dns_arch, 0, 1)
+    g2a.addWidget(_lbl("استراتژی کوئری IP:"), 0, 2)
+    g2a.addWidget(page.pro_dns_strat, 0, 3)
+    g2a.addWidget(_lbl("DNS اصلی ریموت:"), 1, 0)
+    g2a.addWidget(page.pro_remote_dns, 1, 1)
+    g2a.addWidget(_lbl("DNS پشتیبان ریموت:"), 1, 2)
+    g2a.addWidget(page.pro_backup_dns, 1, 3)
+    g2a.addWidget(_lbl("DNS مستقیم ایران:"), 2, 0)
+    g2a.addWidget(page.pro_direct_dns, 2, 1)
+    g2a.addWidget(_lbl("DNS پایه (Bootstrap):"), 2, 2)
+    g2a.addWidget(page.pro_boot_dns, 2, 3)
+    v2.addWidget(p2a)
+
+    p2b, g2b = _make_panel("سپر ضد نشت DNS، FakeDNS، ساب‌نت EDNS و جدول Hosts")
+    page.pro_dns_hijack53 = QCheckBox(_rtl_mix("ربایش اجباری پورت ۵۳ روی هسته (ضد نشت DNS ویندوز)"))
+    page.pro_fakedns_chk = QCheckBox(_rtl_mix("فعال‌سازی FakeDNS برای کاهش تاخیر به صفر"))
+    page.pro_dns_nofb_chk = QCheckBox(_rtl_mix("ممنوعیت بازگشت به DNS مسموم سیستم"))
+    page.pro_dns_nofb_match = QCheckBox(_rtl_mix("قفل دامنه تطبیق‌یافته (DisableFallbackIfMatch)"))
+    page.pro_dns_nocache_chk = QCheckBox(_rtl_mix("غیرفعال‌سازی کش داخلی DNS هسته"))
+
+    page.pro_edns_ip = QLineEdit("")
+    page.pro_edns_ip.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    page.pro_edns_ip.setPlaceholderText("Optional clean IP e.g. 1.1.1.1 (empty = off)")
+
+    page.pro_fakedns_pool = QSpinBox()
+    page.pro_fakedns_pool.setRange(4096, 131072)
+    page.pro_fakedns_pool.setSingleStep(4096)
+    page.pro_fakedns_pool.setValue(65535)
+
+    page.pro_dns_hosts = _ltr_edit("cloudflare-dns.com=1.1.1.1\ndns.google=8.8.8.8", height=54)
+
+    g2b.addWidget(page.pro_dns_hijack53, 0, 0, 1, 2)
+    g2b.addWidget(page.pro_fakedns_chk, 0, 2, 1, 2)
+    g2b.addWidget(page.pro_dns_nofb_chk, 1, 0, 1, 2)
+    g2b.addWidget(page.pro_dns_nofb_match, 1, 2, 1, 2)
+    g2b.addWidget(_lbl("EDNS Client IP (اختیاری):"), 2, 0)
+    g2b.addWidget(page.pro_edns_ip, 2, 1)
+    g2b.addWidget(_lbl("ظرفیت FakeDNS Pool:"), 2, 2)
+    g2b.addWidget(page.pro_fakedns_pool, 2, 3)
+    g2b.addWidget(_lbl("جدول استاتیک Hosts:"), 3, 0)
+    g2b.addWidget(page.pro_dns_hosts, 3, 1, 1, 3)
+    g2b.addWidget(page.pro_dns_nocache_chk, 4, 0, 1, 4)
+
+    # Live DNS Benchmark & Flush Toolbar
+    dns_tools = QHBoxLayout()
+    dns_tools.setSpacing(8)
+    page.btn_dns_bench = ActionPillButton("spark", "بنچمارک و تشخیص مسمومیت DNS", variant="amber")
+    page.btn_dns_flush = ActionPillButton("refresh", "پاکسازی کش DNS ویندوز", variant="ghost")
+    page.btn_dns_bench.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    page.btn_dns_flush.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    dns_tools.addWidget(page.btn_dns_bench, 1)
+    dns_tools.addWidget(page.btn_dns_flush, 1)
+    g2b.addLayout(dns_tools, 5, 0, 1, 4)
+
+    page.dns_lab_status = QLabel(_rtl_mix("آماده اجرای بنچمارک زنده DNS و تشخیص مسمومیت 10.10.34.x"))
+    page.dns_lab_status.setWordWrap(True)
+    page.dns_lab_status.setStyleSheet(
+        "color: #34D399; font-size: 11px; font-weight: 600; padding: 6px 10px; "
+        "background: rgba(16, 185, 129, 0.10); border: 1px solid rgba(52, 211, 153, 0.28); border-radius: 9px;"
+    )
+    g2b.addWidget(page.dns_lab_status, 6, 0, 1, 4)
+    v2.addWidget(p2b)
+    v2.addStretch(1)
+    tabs.addTab(tab_dns, _rtl_mix("آزمایشگاه \u2066DNS\u2069"))
+
+    # ================= TAB 3: Routing & Firewall ACL =================
+    tab_rt = QWidget()
+    v3 = QVBoxLayout(tab_rt)
+    v3.setContentsMargins(4, 4, 4, 4)
+    v3.setSpacing(10)
+
+    p3a, g3a = _make_panel("موتور تطبیق مسیریابی و فیلترهای فایروال")
+    page.pro_route_strat = QComboBox()
+    for lbl, val in (
+        ("تطبیق هوشمند دامنه و IP — IPIfNonMatch (پیشنهادی)", "IPIfNonMatch"),
+        ("فقط بر اساس دامنه — AsIs (سریع‌ترین)", "AsIs"),
+        ("تبدیل فوری به IP — IPOnDemand", "IPOnDemand"),
+    ):
+        page.pro_route_strat.addItem(_rtl_mix(lbl), val)
+
+    page.pro_block_ads = QCheckBox(_rtl_mix("مسدودسازی تبلیغات و ردیاب‌ها (Ads & Trackers)"))
+    page.pro_bypass_lan = QCheckBox(_rtl_mix("معافیت کامل شبکه محلی و مودم (LAN / Private)"))
+
+    g3a.addWidget(_lbl("استراتژی مسیریابی:"), 0, 0)
+    g3a.addWidget(page.pro_route_strat, 0, 1, 1, 3)
+    g3a.addWidget(page.pro_block_ads, 1, 0, 1, 2)
+    g3a.addWidget(page.pro_bypass_lan, 1, 2, 1, 2)
+    v3.addWidget(p3a)
+
+    p3b, g3b = _make_panel("لیست‌های دسترسی سفارشی (هر خط یک دامنه، geosite یا رنج IP)")
+    page.pro_proxy_rules = _ltr_edit("gemini.google.com\nopenai.com\nclaude.ai", height=58)
+    page.pro_direct_rules = _ltr_edit("digikala.com\n192.168.1.0/24", height=58)
+    page.pro_block_rules = _ltr_edit("doubleclick.net\ngooglesyndication.com", height=52)
+
+    g3b.addWidget(_lbl("اجبار به تونل (Proxy):"), 0, 0)
+    g3b.addWidget(page.pro_proxy_rules, 0, 1, 1, 3)
+    g3b.addWidget(_lbl("عبور مستقیم (Direct):"), 1, 0)
+    g3b.addWidget(page.pro_direct_rules, 1, 1, 1, 3)
+    g3b.addWidget(_lbl("مسدودسازی (Block):"), 2, 0)
+    g3b.addWidget(page.pro_block_rules, 2, 1, 1, 3)
+    v3.addWidget(p3b)
+    v3.addStretch(1)
+    tabs.addTab(tab_rt, "فایروال و مسیریابی")
+
+    # ================= TAB 4: TCP Socket & Anti-DPI L4 Tuning =================
+    tab_l4 = QWidget()
+    v4 = QVBoxLayout(tab_l4)
+    v4.setContentsMargins(4, 4, 4, 4)
+    v4.setSpacing(10)
+
+    p4a, g4a = _make_panel("تیونینگ سوکت لایه ۴ (MTU / MSS / بافرهای کرنل)")
+    page.pro_tun_mtu = QSpinBox()
+    page.pro_tun_mtu.setRange(1200, 1500)
+    page.pro_tun_mtu.setValue(1360)
+
+    page.pro_tcp_mss = QSpinBox()
+    page.pro_tcp_mss.setRange(0, 1460)
+    page.pro_tcp_mss.setSpecialValueText("خودکار سیستم")
+    page.pro_tcp_mss.setValue(1220)
+
+    page.pro_rcvbuf_kb = QSpinBox()
+    page.pro_rcvbuf_kb.setRange(64, 1024)
+    page.pro_rcvbuf_kb.setSingleStep(32)
+    page.pro_rcvbuf_kb.setSuffix(" KB")
+    page.pro_rcvbuf_kb.setValue(256)
+
+    page.pro_sndbuf_kb = QSpinBox()
+    page.pro_sndbuf_kb.setRange(32, 512)
+    page.pro_sndbuf_kb.setSingleStep(16)
+    page.pro_sndbuf_kb.setSuffix(" KB")
+    page.pro_sndbuf_kb.setValue(96)
+
+    page.pro_keepalive_sec = QSpinBox()
+    page.pro_keepalive_sec.setRange(0, 300)
+    page.pro_keepalive_sec.setSuffix(" ثانیه")
+    page.pro_keepalive_sec.setValue(30)
+
+    page.pro_nodelay_chk = QCheckBox(_rtl_mix("فعال‌سازی TCP_NODELAY (حذف تاخیر برای پینگ پایین)"))
+    page.pro_tfo_chk = QCheckBox(_rtl_mix("فعال‌سازی TCP Fast Open"))
+
+    g4a.addWidget(_lbl("سایز TUN MTU:"), 0, 0)
+    g4a.addWidget(page.pro_tun_mtu, 0, 1)
+    g4a.addWidget(_lbl("سقف TCP MSS:"), 0, 2)
+    g4a.addWidget(page.pro_tcp_mss, 0, 3)
+    g4a.addWidget(_lbl("بافر دریافت (RCVBUF):"), 1, 0)
+    g4a.addWidget(page.pro_rcvbuf_kb, 1, 1)
+    g4a.addWidget(_lbl("بافر ارسال (SNDBUF):"), 1, 2)
+    g4a.addWidget(page.pro_sndbuf_kb, 1, 3)
+    g4a.addWidget(_lbl("بازه KeepAlive:"), 2, 0)
+    g4a.addWidget(page.pro_keepalive_sec, 2, 1)
+    g4a.addWidget(page.pro_tfo_chk, 2, 2, 1, 2)
+    g4a.addWidget(page.pro_nodelay_chk, 3, 0, 1, 4)
+    v4.addWidget(p4a)
+
+    p4b, g4b = _make_panel("تکه‌تکه‌سازی بومی Xray (Native TLS Fragment)")
+    page.pro_frag_chk = QCheckBox(_rtl_mix("فعال‌سازی Native Fragment روی اتصالات مستقیم"))
+    page.pro_frag_pkts = QComboBox()
+    page.pro_frag_pkts.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    for v in ("tlshello", "1-3", "1-2", "1-5"):
+        page.pro_frag_pkts.addItem(v)
+    page.pro_frag_len = QLineEdit("10-30")
+    page.pro_frag_len.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+    page.pro_frag_int = QLineEdit("5-15")
+    page.pro_frag_int.setLayoutDirection(Qt.LayoutDirection.LeftToRight)
+
+    g4b.addWidget(page.pro_frag_chk, 0, 0, 1, 4)
+    g4b.addWidget(_lbl("بسته‌های هدف:"), 1, 0)
+    g4b.addWidget(page.pro_frag_pkts, 1, 1)
+    g4b.addWidget(_lbl("طول (B) / تاخیر (ms):"), 1, 2)
+    fp_box = QHBoxLayout()
+    fp_box.setSpacing(6)
+    fp_box.addWidget(page.pro_frag_len)
+    fp_box.addWidget(page.pro_frag_int)
+    g4b.addLayout(fp_box, 1, 3)
+    v4.addWidget(p4b)
+    v4.addStretch(1)
+    tabs.addTab(tab_l4, "سوکت و ضد فیلتر")
+
+    # ================= TAB 5: Hardware, RAM & CPU Engine =================
+    tab_hw = QWidget()
+    v5 = QVBoxLayout(tab_hw)
+    v5.setContentsMargins(4, 4, 4, 4)
+    v5.setSpacing(10)
+
+    p5a, g5a = _make_panel("مانیتور زنده سخت‌افزار و مهار مصرف حافظه Xray")
+    page.hw_live_badge = QLabel(_rtl_mix("مصرف زنده RAM: در حال محاسبه..."))
+    page.hw_live_badge.setStyleSheet(
+        "color: #34D399; font-weight: 700; font-size: 12px; padding: 9px 12px; "
+        "background: rgba(16, 185, 129, 0.11); border: 1px solid rgba(52, 211, 153, 0.34); border-radius: 10px;"
+    )
+
+    page.pro_mem_limit = QSpinBox()
+    page.pro_mem_limit.setRange(32, 256)
+    page.pro_mem_limit.setSingleStep(8)
+    page.pro_mem_limit.setSuffix(" MiB")
+    page.pro_mem_limit.setValue(48)
+
+    page.pro_gogc = QSpinBox()
+    page.pro_gogc.setRange(20, 150)
+    page.pro_gogc.setSingleStep(10)
+    page.pro_gogc.setSuffix(" %")
+    page.pro_gogc.setValue(40)
+
+    page.pro_pol_buf = QSpinBox()
+    page.pro_pol_buf.setRange(32, 512)
+    page.pro_pol_buf.setSingleStep(32)
+    page.pro_pol_buf.setSuffix(" KB")
+    page.pro_pol_buf.setValue(128)
+
+    page.pro_idle_reaper = QSpinBox()
+    page.pro_idle_reaper.setRange(45, 600)
+    page.pro_idle_reaper.setSingleStep(15)
+    page.pro_idle_reaper.setSuffix(" ثانیه")
+    page.pro_idle_reaper.setValue(180)
+
+    page.pro_max_logs = QSpinBox()
+    page.pro_max_logs.setRange(80, 1000)
+    page.pro_max_logs.setSingleStep(50)
+    page.pro_max_logs.setSuffix(" خط")
+    page.pro_max_logs.setValue(250)
+
+    page.pro_tray_trim = QCheckBox(_rtl_mix("آزادسازی خودکار RAM و توقف انیمیشن هنگام Minimize / Tray"))
+    page.pro_eco_mode = QCheckBox(_rtl_mix("حالت اقتصادی (توقف کامل انیمیشن‌ها برای حداقل مصرف CPU)"))
+
+    page.btn_hw_trim_now = ActionPillButton("spark", "آزادسازی فوری RAM", variant="emerald")
+    page.btn_hw_refresh = ActionPillButton("refresh", "بروزرسانی آمار زنده", variant="ghost")
+    page.btn_hw_trim_now.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+    page.btn_hw_refresh.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    g5a.addWidget(page.hw_live_badge, 0, 0, 1, 4)
+    g5a.addWidget(_lbl("سقف رم هسته (GOMEMLIMIT):"), 1, 0)
+    g5a.addWidget(page.pro_mem_limit, 1, 1)
+    g5a.addWidget(_lbl("حساسیت GC هسته (GOGC):"), 1, 2)
+    g5a.addWidget(page.pro_gogc, 1, 3)
+    g5a.addWidget(_lbl("بافر هر اتصال Xray:"), 2, 0)
+    g5a.addWidget(page.pro_pol_buf, 2, 1)
+    g5a.addWidget(_lbl("پاکساز اتصالات بی‌مصرف:"), 2, 2)
+    g5a.addWidget(page.pro_idle_reaper, 2, 3)
+    g5a.addWidget(_lbl("سقف خطوط کنسول لاگ:"), 3, 0)
+    g5a.addWidget(page.pro_max_logs, 3, 1)
+    hw_btns = QHBoxLayout()
+    hw_btns.setSpacing(8)
+    hw_btns.addWidget(page.btn_hw_trim_now, 1)
+    hw_btns.addWidget(page.btn_hw_refresh, 1)
+    g5a.addLayout(hw_btns, 3, 2, 1, 2)
+    g5a.addWidget(page.pro_tray_trim, 4, 0, 1, 4)
+    g5a.addWidget(page.pro_eco_mode, 5, 0, 1, 4)
+    v5.addWidget(p5a)
+    v5.addStretch(1)
+    tabs.addTab(tab_hw, "سخت‌افزار و بهینه‌سازی")
+
+    cv.addWidget(tabs)
+
+    page.pro_status_lbl = QLabel(_rtl_mix("تغییرات پس از ذخیره روی سوکت‌ها و حافظه اعمال می‌شوند؛ با «ذخیره و اعمال فوری» تونل فعال همان لحظه بروزرسانی می‌شود."))
+    page.pro_status_lbl.setWordWrap(True)
+    page.pro_status_lbl.setStyleSheet("color: #9CA3AF; font-size: 11px;")
+    cv.addWidget(page.pro_status_lbl)
+
+    action_bar = QHBoxLayout()
+    action_bar.setSpacing(10)
+    page.btn_pro_save = ActionPillButton("check", "ذخیره تنظیمات", variant="emerald")
+    page.btn_pro_hotreload = ActionPillButton("spark", "ذخیره و اعمال فوری (Hot-Reload)", variant="amber")
+    page.btn_pro_reset = ActionPillButton("refresh", "بازنشانی پیش‌فرض", variant="ghost")
+    for b in (page.btn_pro_save, page.btn_pro_hotreload, page.btn_pro_reset):
+        b.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        action_bar.addWidget(b, 1)
+    cv.addLayout(action_bar)
+
+    page.btn_pro_save.clicked.connect(lambda: page._emit_pro_settings_save(hot_reload=False))
+    page.btn_pro_hotreload.clicked.connect(lambda: page._emit_pro_settings_save(hot_reload=True))
+    page.btn_pro_reset.clicked.connect(lambda: page._apply_pro_preset("balanced", auto_save=True))
+    page.btn_preset_balanced.clicked.connect(lambda: page._apply_pro_preset("balanced", auto_save=True))
+    page.btn_preset_lowram.clicked.connect(lambda: page._apply_pro_preset("lowram", auto_save=True))
+    page.btn_preset_gaming.clicked.connect(lambda: page._apply_pro_preset("gaming", auto_save=True))
+    page.btn_hw_trim_now.clicked.connect(lambda: page.hw_trim_ram_requested.emit())
+    page.btn_hw_refresh.clicked.connect(lambda: page.hw_refresh_stats_requested.emit())
+    page.btn_dns_bench.clicked.connect(lambda: page.dns_benchmark_requested.emit())
+    page.btn_dns_flush.clicked.connect(lambda: page.dns_flush_requested.emit())
+    page.dns_benchmark_finished.connect(page._on_dns_benchmark_finished_ui)
+
+    ins_at = target_v.count()
+    if ins_at > 0 and target_v.itemAt(ins_at - 1).spacerItem() is not None:
+        ins_at -= 1
+    target_v.insertWidget(ins_at, card)

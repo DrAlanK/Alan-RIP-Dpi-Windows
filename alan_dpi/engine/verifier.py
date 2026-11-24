@@ -162,171 +162,245 @@ class TunnelStreamVerifier:
             "isp": isp.strip(),
         }
 
+    _DATACENTER_KEYWORDS = (
+        "cloudflare", "amazon", "aws", "google cloud", "gcp", "digitalocean",
+        "hetzner", "ovh", "linode", "akamai", "vultr", "choopa", "contabo",
+        "oracle", "microsoft", "azure", "alibaba", "aliyun", "tencent",
+        "datacamp", "m247", "leaseweb", "psychz", "hostinger", "scalaxy",
+        "aeza", "stark industries", "vultr", "serverius", "fdcservers",
+        "hosting", "datacenter", "data center", "vps", "cloud", "cdn",
+        "fastly", "scaleway", "kamatera", "upcloud", "ionos", "aruba",
+    )
+
+    _GEMINI_BLOCKED_COUNTRIES = {
+        "IR", "CN", "HK", "MO", "RU", "BY", "KP", "SY", "CU", "VE", "AF", "MM",
+    }
+
+    _GEMINI_GEO_BLOCK_PHRASES = (
+        "gemini isn't currently supported in your country",
+        "currently supported in your country. stay tuned",
+        "not currently supported in your country",
+        "gemini isn't available in your country",
+        "not available in your country",
+        "isn't available in your region",
+        "not available in your region",
+        "country is not supported",
+        "region is not supported",
+        "location isn't supported",
+        "not supported in your location",
+        "unavailable in your country",
+        "user location is not supported",
+        "isunsupportedcountry\":true",
+        "unsupported_country",
+    )
+
     @classmethod
-    def resolve_egress_geo(cls, http_port: int, timeout: float = 4.2) -> dict:
-        sess = cls._make_proxy_session(http_port)
-        try:
-            try:
-                r_ipapi = sess.get(
-                    "http://ip-api.com/json/?fields=status,country,countryCode,isp,org,as,mobile,proxy,hosting,query",
-                    timeout=timeout,
-                )
-                if r_ipapi.status_code == 200:
-                    d = r_ipapi.json()
-                    if d.get("status") == "success" and d.get("query"):
-                        return cls._build_geo_dict(
-                            ip_str=str(d.get("query")),
-                            cc_raw=str(d.get("countryCode") or ""),
-                            fallback_country=str(d.get("country") or ""),
-                            is_datacenter=bool(d.get("hosting", False)),
-                            is_proxy=bool(d.get("proxy", False)),
-                            asn=str(d.get("as") or ""),
-                            org=str(d.get("org") or ""),
-                            isp=str(d.get("isp") or ""),
-                        )
-            except Exception:
-                pass
+    def _classify_ip_datacenter(cls, isp: str, org: str, asn: str, hosting_flag=None, proxy_flag=None) -> Tuple[bool, str, str]:
+        blob = f"{isp} {org} {asn}".lower()
+        is_dc = bool(hosting_flag) or bool(proxy_flag) or any(k in blob for k in cls._DATACENTER_KEYWORDS)
+        if is_dc:
+            return True, "DATACENTER", "دیتاسنتر"
+        if isp or org:
+            return False, "RESIDENTIAL", "خانگی/ISP"
+        return False, "UNKNOWN", "نامشخص"
 
-            try:
-                r_who = sess.get("https://ipwho.is/", timeout=timeout)
-                if r_who.status_code == 200:
-                    d2 = r_who.json()
-                    if d2.get("success", True) and d2.get("ip"):
-                        conn = d2.get("connection") or {}
-                        sec = d2.get("security") or {}
-                        return cls._build_geo_dict(
-                            ip_str=str(d2.get("ip")),
-                            cc_raw=str(d2.get("country_code") or ""),
-                            fallback_country=str(d2.get("country") or ""),
-                            is_datacenter=bool(sec.get("hosting", False)),
-                            is_proxy=bool(sec.get("proxy", False) or sec.get("vpn", False) or sec.get("tor", False)),
-                            asn=str(conn.get("asn") or ""),
-                            org=str(conn.get("org") or ""),
-                            isp=str(conn.get("isp") or ""),
-                        )
-            except Exception:
-                pass
+    @classmethod
+    def resolve_egress_geo(cls, http_port: int, timeout: float = 5.0) -> dict:
+        from alan_dpi.engine.models import LocationExtractor
+        px = f"http://127.0.0.1:{int(http_port)}"
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": px, "https": px}
+        sess.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
 
-            try:
-                r_info = sess.get("https://ipinfo.io/json", timeout=timeout)
-                if r_info.status_code == 200:
-                    d3 = r_info.json()
-                    if d3.get("ip"):
-                        org_str = str(d3.get("org") or "")
-                        return cls._build_geo_dict(
-                            ip_str=str(d3.get("ip")),
-                            cc_raw=str(d3.get("country") or ""),
-                            asn=org_str.split(" ")[0] if org_str else "",
-                            org=org_str,
-                        )
-            except Exception:
-                pass
-
-            try:
-                r_cf = sess.get("https://api.country.is/", timeout=timeout)
-                if r_cf.status_code == 200:
-                    d4 = r_cf.json()
-                    if d4.get("ip"):
-                        return cls._build_geo_dict(str(d4.get("ip")), str(d4.get("country") or ""))
-            except Exception:
-                pass
-        finally:
-            sess.close()
-
-        return {
+        out = {
             "ip": "---",
             "country_code": "",
-            "country_en": "Global",
-            "country_fa": "مسیر جهانی",
+            "country_en": "Unknown",
+            "country_fa": "نامشخص",
+            "isp": "",
+            "org": "",
+            "asn": "",
             "is_datacenter": False,
             "is_proxy": False,
-            "asn": "",
-            "org": "",
-            "isp": "",
+            "ip_type": "UNKNOWN",
+            "ip_type_fa": "نامشخص",
         }
-
-    @classmethod
-    def check_gemini_access(
-        cls,
-        http_port: int,
-        timeout: float = 5.2,
-        geo_hint: Optional[dict] = None,
-    ) -> Tuple[bool, str]:
-        geo = geo_hint if isinstance(geo_hint, dict) and geo_hint.get("ip", "---") != "---" else cls.resolve_egress_geo(http_port, timeout=3.8)
-        cc = (geo.get("country_code") or "").upper()
-        is_dc = bool(geo.get("is_datacenter", False))
-        is_px = bool(geo.get("is_proxy", False))
-        meta_blob = f"{geo.get('asn', '')} {geo.get('org', '')} {geo.get('isp', '')}".lower()
-
-        if cc in GEMINI_BLOCKED_COUNTRIES:
-            return False, f"BLOCKED_COUNTRY_{cc}"
-
-        if any(bad in meta_blob for bad in ABUSED_DATACENTER_KEYWORDS):
-            return False, "BLOCKED_DATACENTER"
-
-        if is_dc and is_px:
-            return False, "FLAGGED_DATACENTER_PROXY"
-
-        sess = cls._make_proxy_session(http_port)
-        sess.cookies.set("SOCS", "CAISHAgBEhJnd3NfMjAyNDAxMTYtMF9SQzIaAmVuIAEaBgiA_LyuBg", domain=".google.com")
-        sess.cookies.set("CONSENT", "YES+cb.20240116-07-p0.en+FX+410", domain=".google.com")
-
         try:
-            api_probe = sess.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=AIzaSyDummyKeyRegionProbe00000000000000",
-                json={"contents": [{"parts": [{"text": "ping"}]}]},
-                timeout=timeout,
-            )
-            api_txt = (api_probe.text or "").lower()
-            if (
-                ("location is not supported" in api_txt)
-                or ("user location is not supported" in api_txt)
-                or (api_probe.status_code in (403, 451) and "api_key_invalid" not in api_txt)
-            ):
-                return False, ("BLOCKED_DATACENTER" if is_dc else "BLOCKED_REGION")
+            # Primary: ip-api.com (provides exact hosting & proxy flags)
+            try:
+                r = sess.get(
+                    "http://ip-api.com/json/?fields=status,country,countryCode,isp,org,as,hosting,proxy,query",
+                    timeout=timeout,
+                )
+                if r.status_code == 200:
+                    js = r.json()
+                    if js.get("status") == "success":
+                        cc = str(js.get("countryCode") or "").strip().upper()
+                        en_n, fa_n = LocationExtractor.get_country_names(cc) if cc else (str(js.get("country") or "Unknown"), "نامشخص")
+                        isp = str(js.get("isp") or "").strip()
+                        org = str(js.get("org") or "").strip()
+                        asn = str(js.get("as") or "").strip()
+                        is_dc, t_en, t_fa = cls._classify_ip_datacenter(
+                            isp, org, asn, js.get("hosting"), js.get("proxy")
+                        )
+                        out.update({
+                            "ip": str(js.get("query") or "---"),
+                            "country_code": cc,
+                            "country_en": en_n,
+                            "country_fa": fa_n,
+                            "isp": isp,
+                            "org": org,
+                            "asn": asn,
+                            "is_datacenter": is_dc,
+                            "is_proxy": bool(js.get("proxy")),
+                            "ip_type": t_en,
+                            "ip_type_fa": t_fa,
+                        })
+                        return out
+            except Exception:
+                pass
 
-            web_resp = sess.get(
-                "https://gemini.google.com/app?hl=en",
-                headers={"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-                timeout=timeout,
-                allow_redirects=True,
-            )
-            final_url = (web_resp.url or "").lower()
-            if (
-                ("/faq" in final_url)
-                or ("unsupported" in final_url)
-                or ("/sorry/" in final_url)
-                or (web_resp.status_code != 200)
-            ):
-                return False, ("BLOCKED_DATACENTER" if is_dc else "BLOCKED_REGION")
+            # Fallback: ipwho.is
+            try:
+                r2 = sess.get("https://ipwho.is/", timeout=timeout)
+                if r2.status_code == 200:
+                    js2 = r2.json()
+                    if js2.get("success", True) and js2.get("ip"):
+                        cc = str(js2.get("country_code") or "").strip().upper()
+                        en_n, fa_n = LocationExtractor.get_country_names(cc) if cc else (str(js2.get("country") or "Unknown"), "نامشخص")
+                        conn = js2.get("connection") if isinstance(js2.get("connection"), dict) else {}
+                        isp = str(conn.get("isp") or "").strip()
+                        org = str(conn.get("org") or "").strip()
+                        asn = str(conn.get("asn") or "").strip()
+                        sec = js2.get("security") if isinstance(js2.get("security"), dict) else {}
+                        is_dc, t_en, t_fa = cls._classify_ip_datacenter(
+                            isp, org, asn, sec.get("hosting"), sec.get("proxy") or sec.get("vpn")
+                        )
+                        out.update({
+                            "ip": str(js2.get("ip") or "---"),
+                            "country_code": cc,
+                            "country_en": en_n,
+                            "country_fa": fa_n,
+                            "isp": isp,
+                            "org": org,
+                            "asn": asn,
+                            "is_datacenter": is_dc,
+                            "is_proxy": bool(sec.get("proxy") or sec.get("vpn")),
+                            "ip_type": t_en,
+                            "ip_type_fa": t_fa,
+                        })
+                        return out
+            except Exception:
+                pass
 
-            raw_html = (web_resp.text or "")
-            norm_html = raw_html.lower().replace("&#39;", "'").replace("’", "'").replace("&apos;", "'")
-
-            blocked_phrases = (
-                "currently supported in your country",
-                "not supported in your country",
-                "not available in your country",
-                "isn't currently supported",
-                "stay tuned!",
-                "unusual traffic from your computer network",
-            )
-            if any(phrase in norm_html for phrase in blocked_phrases):
-                return False, ("BLOCKED_DATACENTER" if is_dc else "BLOCKED_REGION")
-
-            gl_match = re.search(r'"(?:gl|country_code)"\s*:\s*"([a-zA-Z]{2})"', raw_html)
-            if gl_match and (gl_match.group(1).upper() in GEMINI_BLOCKED_COUNTRIES):
-                return False, "GOOGLE_GEO_BLOCKED"
-
-            valid_markers = ("bardchatui", "accounts.google.com/servicelogin", "sign in", "wiz_global_data")
-            if not any(m in norm_html for m in valid_markers):
-                return False, "UNVERIFIED_HTML"
-
-            return True, ("OK_DATACENTER" if is_dc else "OK_RESIDENTIAL")
-        except Exception:
-            return False, "UNREACHABLE"
+            # Fallback 2: Cloudflare trace (always available over TLS)
+            try:
+                r3 = sess.get("https://1.1.1.1/cdn-cgi/trace", timeout=min(timeout, 3.5))
+                if r3.status_code == 200:
+                    kv = {}
+                    for ln in r3.text.splitlines():
+                        if "=" in ln:
+                            k, v = ln.split("=", 1)
+                            kv[k.strip()] = v.strip()
+                    cc = str(kv.get("loc") or "").strip().upper()
+                    en_n, fa_n = LocationExtractor.get_country_names(cc) if cc else ("Unknown", "نامشخص")
+                    out.update({
+                        "ip": str(kv.get("ip") or "---"),
+                        "country_code": cc,
+                        "country_en": en_n,
+                        "country_fa": fa_n,
+                    })
+            except Exception:
+                pass
+            return out
         finally:
             sess.close()
+
+    @classmethod
+    def _contains_gemini_geo_block_text(cls, html_text: str, final_url: str = "") -> bool:
+        norm_url = str(final_url or "").lower()
+        if any(tok in norm_url for tok in ("/unavailable", "/unsupported", "/sorry/index")):
+            return True
+        norm = (
+            str(html_text or "")
+            .replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .lower()
+        )
+        return any(phrase in norm for phrase in cls._GEMINI_GEO_BLOCK_PHRASES)
+
+    @classmethod
+    def check_gemini_access(cls, http_port: int, timeout: float = 5.5, geo_hint: Optional[dict] = None) -> Tuple[bool, str]:
+        """
+        3-Layer Gemini Verification (Eliminates HTTP-200 false positives):
+          1) Egress IP Geo + Datacenter/Hosting classification
+          2) gemini.google.com/?hl=en & /app?hl=en HTTP status + exact HTML unsupported-country inspection
+          3) generativelanguage.googleapis.com API geo-enforcement probe (immune to Angular CSR)
+        """
+        geo = geo_hint if isinstance(geo_hint, dict) and geo_hint.get("country_code") else cls.resolve_egress_geo(http_port=http_port, timeout=min(timeout, 4.0))
+        cc = str(geo.get("country_code") or "").strip().upper()
+        is_dc = bool(geo.get("is_datacenter", False))
+        ip_tag = "DC" if is_dc else ("ISP" if geo.get("ip_type") == "RESIDENTIAL" else "IP")
+
+        if cc and (cc in cls._GEMINI_BLOCKED_COUNTRIES):
+            return False, f"BLOCKED ({cc} Geo-Restricted | {ip_tag})"
+
+        px = f"http://127.0.0.1:{int(http_port)}"
+        sess = requests.Session()
+        sess.trust_env = False
+        sess.proxies = {"http": px, "https": px}
+        sess.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+
+        try:
+            # Layer 2: Web page inspection (catches 403/451 AND HTTP-200 "Gemini isn't currently supported in your country. Stay tuned!")
+            web_ok = False
+            for url in ("https://gemini.google.com/?hl=en", "https://gemini.google.com/app?hl=en"):
+                try:
+                    resp = sess.get(url, timeout=timeout, allow_redirects=True)
+                    if resp.status_code in (403, 451):
+                        return False, f"BLOCKED (Web HTTP {resp.status_code} | IP={geo.get('ip', '?')} {cc or '?'} {ip_tag} | ISP={str(geo.get('isp', '-'))[:24]})"
+                    if resp.status_code >= 500:
+                        continue
+                    body_head = (resp.text or "")[:180000]
+                    if cls._contains_gemini_geo_block_text(body_head, str(resp.url)):
+                        return False, f"BLOCKED (Web HTML: Country Unsupported | IP={geo.get('ip', '?')} {cc or '?'} {ip_tag} | ISP={str(geo.get('isp', '-'))[:24]})"
+                    if resp.status_code == 200:
+                        web_ok = True
+                        break
+                except Exception:
+                    continue
+
+            if not web_ok:
+                return False, f"BLOCKED (Unreachable | {ip_tag})"
+
+            # Layer 3: Deterministic Google AI API geo check (catches Angular client-side blocks immediately)
+            try:
+                api_resp = sess.get(
+                    "https://generativelanguage.googleapis.com/v1beta/models",
+                    timeout=min(timeout, 4.5),
+                    allow_redirects=False,
+                )
+                api_txt = (api_resp.text or "")[:4000].lower()
+                if api_resp.status_code == 451 or "user location is not supported" in api_txt or "location is not supported" in api_txt:
+                    return False, f"BLOCKED (Google AI API Geo-Denied HTTP {api_resp.status_code} | IP={geo.get('ip', '?')} {cc or '?'} {ip_tag} | ISP={str(geo.get('isp', '-'))[:24]})"
+                if api_resp.status_code == 403 and ("api_key" not in api_txt and "unregistered" not in api_txt and "credentials" not in api_txt):
+                    return False, f"BLOCKED (API 403 | {cc or '?'} {ip_tag})"
+            except Exception:
+                pass
+
+            isp_s = str(geo.get("isp") or geo.get("org") or "-")[:28]
+            return True, f"OK ({geo.get('ip', '?')} | {cc or 'Global'} | {ip_tag} | {isp_s})"
+        finally:
+            sess.close()
+
+
 
 
     @classmethod

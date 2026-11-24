@@ -329,6 +329,581 @@ def _build_standalone_socks_xray_config(uri: str, socks_port: int, http_port: in
     }
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+_ACTIVE_PRO_SETTINGS_GETTER = None
+_XRAY_LOG_CALLBACK = None
+
+
+def _get_active_pro_settings():
+    fn = _ACTIVE_PRO_SETTINGS_GETTER
+    if callable(fn):
+        try:
+            return fn()
+        except Exception:
+            return None
+    return None
+
+
+def _low_mem_xray_env(base_env=None) -> dict:
+    env = dict(base_env) if base_env is not None else os.environ.copy()
+    s = _get_active_pro_settings()
+    mem_mb = max(32, min(512, int(getattr(s, "xray_mem_limit_mb", 48) or 48)))
+    gogc = max(20, min(150, int(getattr(s, "xray_gogc_percent", 40) or 40)))
+    env["GOMEMLIMIT"] = f"{mem_mb}MiB"
+    env["GOGC"] = str(gogc)
+    return env
+
+
+def _parse_rule_tokens(raw_text: str):
+    domains, ips = [], []
+    for chunk in re.split(r"[\r\n,;]+", str(raw_text or "")):
+        tok = chunk.strip()
+        if not tok or tok.startswith("#"):
+            continue
+        low = tok.lower()
+        if low.startswith(("geoip:",)):
+            ips.append(tok)
+        elif low.startswith(("geosite:", "domain:", "full:", "regexp:", "keyword:")):
+            domains.append(tok)
+        elif re.match(r"^[0-9a-fA-F:.]+(/\d{1,3})?$", tok) and ("." in tok or ":" in tok):
+            ips.append(tok)
+        else:
+            domains.append(f"domain:{tok}")
+    return domains, ips
+
+
+def _has_geo_dat(filename: str) -> bool:
+    base = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    for sub in ("core", "bin", "."):
+        if os.path.isfile(os.path.join(base, sub, filename)):
+            return True
+    return False
+
+
+def _parse_static_dns_hosts(raw_text: str) -> dict:
+    """Parses user `domain=ip` static DNS host mappings (also auto-populates DoH bootstrap IPs)."""
+    import ipaddress
+    hosts = {}
+    for ln in re.split(r"[\r\n;]+", str(raw_text or "")):
+        line = ln.strip()
+        if not line or line.startswith("#"):
+            continue
+        sep = "=" if "=" in line else (":" if line.count(":") == 1 else " ")
+        if sep not in line:
+            continue
+        left, right = line.split(sep, 1)
+        dom = left.strip().lower()
+        val_raw = right.strip()
+        if not dom or not val_raw:
+            continue
+        ips = []
+        for tok in re.split(r"[,\s]+", val_raw):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                ipaddress.ip_address(tok)
+                ips.append(tok)
+            except ValueError:
+                pass
+        if len(ips) == 1:
+            hosts[dom] = ips[0]
+        elif len(ips) > 1:
+            hosts[dom] = ips
+    return hosts
+
+
+def _is_raw_ip(addr: str) -> bool:
+    import ipaddress
+    try:
+        ipaddress.ip_address(str(addr or "").strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _apply_pro_network_settings(cfg: dict) -> dict:
+    """
+    Applies full Pro Network Engineering, Super DNS Lab & Low-RAM Policy settings
+    to active Xray tunnel configs (skips multi-inbound batch pings & Lab probes >=22000).
+    """
+    import ipaddress
+    if not isinstance(cfg, dict) or ("inbounds" not in cfg) or ("outbounds" not in cfg):
+        return cfg
+    inbounds = cfg.get("inbounds")
+    outbounds = cfg.get("outbounds")
+    if not isinstance(inbounds, list) or not isinstance(outbounds, list) or not outbounds:
+        return cfg
+    if len(inbounds) > 4:
+        return cfg
+    if any(int(inb.get("port") or 0) >= 22000 for inb in inbounds if isinstance(inb, dict)):
+        return cfg
+
+    s = _get_active_pro_settings()
+    if s is None:
+        return cfg
+
+    # 1. Hardware RAM Policy
+    buf_kb = max(32, min(512, int(getattr(s, "xray_policy_buffer_kb", 128) or 128)))
+    idle_s = max(45, min(600, int(getattr(s, "xray_conn_idle_sec", 180) or 180)))
+    cfg["policy"] = {
+        "levels": {
+            "0": {
+                "handshake": 4,
+                "connIdle": idle_s,
+                "uplinkOnly": 2,
+                "downlinkOnly": 5,
+                "bufferSize": buf_kb,
+            }
+        },
+        "system": {
+            "statsInboundUplink": False,
+            "statsInboundDownlink": False,
+            "statsOutboundUplink": False,
+            "statsOutboundDownlink": False,
+        },
+    }
+
+    # 2. Log level
+    log_lvl = str(getattr(s, "xray_log_level", "error") or "error").strip().lower()
+    if log_lvl not in ("none", "error", "warning", "info", "debug"):
+        log_lvl = "error"
+    cfg["log"] = {"loglevel": log_lvl}
+
+    # 3. Inbound LAN Share + Sniffing + FakeDNS
+    allow_lan = bool(getattr(s, "allow_lan", False))
+    sniff_on = bool(getattr(s, "sniffing_enabled", True))
+    sniff_ro = bool(getattr(s, "sniffing_route_only", False))
+    dns_arch = str(getattr(s, "dns_architecture", "split_horizon") or "split_horizon").strip().lower()
+    fake_dns = bool(getattr(s, "fake_dns_enabled", False)) or (dns_arch == "fakedns_turbo")
+    dest_ov = ["http", "tls", "quic"]
+    if fake_dns:
+        dest_ov.append("fakedns")
+
+    inbound_tags = []
+    for inb in inbounds:
+        if not isinstance(inb, dict):
+            continue
+        proto_in = str(inb.get("protocol") or "").lower()
+        if proto_in in ("http", "socks", "mixed"):
+            inb["listen"] = "0.0.0.0" if allow_lan else "127.0.0.1"
+        inb["sniffing"] = {
+            "enabled": sniff_on,
+            "destOverride": list(dest_ov),
+            "routeOnly": sniff_ro,
+        }
+        if inb.get("tag"):
+            inbound_tags.append(str(inb["tag"]))
+
+    # 4. Primary proxy outbound tuning
+    primary = None
+    for ob in outbounds:
+        if isinstance(ob, dict) and str(ob.get("tag") or "") not in ("direct", "block", "dns-out", "fragment"):
+            primary = ob
+            break
+
+    has_geosite = _has_geo_dat("geosite.dat")
+    has_geoip = _has_geo_dat("geoip.dat")
+
+    if primary is not None:
+        p_tag = str(primary.get("tag") or "proxy")
+        st = primary.setdefault("streamSettings", {})
+        sec = str(st.get("security") or "none").lower()
+
+        fp_ov = str(getattr(s, "tls_fingerprint_override", "keep") or "keep").strip().lower()
+        alpn_ov = str(getattr(s, "tls_alpn_override", "keep") or "keep").strip().lower()
+        allow_ins = bool(getattr(s, "allow_insecure_tls", False))
+
+        if sec == "tls":
+            ts = st.setdefault("tlsSettings", {})
+            if fp_ov and fp_ov != "keep":
+                ts["fingerprint"] = fp_ov
+            if alpn_ov and alpn_ov != "keep":
+                ts["alpn"] = [x.strip() for x in alpn_ov.split(",") if x.strip()]
+            if allow_ins:
+                ts["allowInsecure"] = True
+        elif sec == "reality":
+            rs = st.setdefault("realitySettings", {})
+            if fp_ov and fp_ov != "keep":
+                rs["fingerprint"] = fp_ov
+
+        sockopt = st.setdefault("sockopt", {})
+        if bool(getattr(s, "tcp_fast_open", False)):
+            sockopt["tcpFastOpen"] = True
+        ka = max(0, min(300, int(getattr(s, "tcp_keepalive_sec", 30) or 0)))
+        if ka > 0:
+            sockopt["tcpKeepAliveInterval"] = ka
+        if bool(getattr(s, "tcp_nodelay_enabled", True)):
+            sockopt["tcpNoDelay"] = True
+
+        has_vision = False
+        try:
+            vnext = (primary.get("settings") or {}).get("vnext") or []
+            for vn in vnext:
+                for u in (vn.get("users") or []):
+                    if "vision" in str(u.get("flow") or "").lower():
+                        has_vision = True
+        except Exception:
+            pass
+
+        if bool(getattr(s, "mux_enabled", False)) and (not has_vision):
+            conc = max(1, min(32, int(getattr(s, "mux_concurrency", 8) or 8)))
+            primary["mux"] = {
+                "enabled": True,
+                "concurrency": conc,
+                "xudpConcurrency": max(8, conc * 2),
+                "xudpProxyUDP443": "reject",
+            }
+
+        remote_addr = ""
+        try:
+            s_obj = primary.get("settings") or {}
+            if isinstance(s_obj.get("vnext"), list) and s_obj["vnext"]:
+                remote_addr = str(s_obj["vnext"][0].get("address") or "")
+            elif isinstance(s_obj.get("servers"), list) and s_obj["servers"]:
+                remote_addr = str(s_obj["servers"][0].get("address") or "")
+        except Exception:
+            pass
+
+        if (
+            bool(getattr(s, "xray_fragment_enabled", False))
+            and remote_addr not in ("127.0.0.1", "localhost", "::1", "")
+            and not any(str(o.get("tag") or "") == "fragment" for o in outbounds)
+        ):
+            frag_out = {
+                "tag": "fragment",
+                "protocol": "freedom",
+                "settings": {
+                    "domainStrategy": "UseIP",
+                    "fragment": {
+                        "packets": str(getattr(s, "xray_fragment_packets", "tlshello") or "tlshello"),
+                        "length": str(getattr(s, "xray_fragment_length", "10-30") or "10-30"),
+                        "interval": str(getattr(s, "xray_fragment_interval", "5-15") or "5-15"),
+                    },
+                },
+                "streamSettings": {"sockopt": {"tcpNoDelay": True, "tcpKeepAliveIdle": 60}},
+            }
+            outbounds.append(frag_out)
+            sockopt["dialerProxy"] = "fragment"
+
+        # 5. SUPER DNS LAB ENGINE
+        q_strat = str(getattr(s, "dns_query_strategy", "UseIPv4") or "UseIPv4").strip()
+        if q_strat not in ("UseIP", "UseIPv4", "UseIPv6"):
+            q_strat = "UseIPv4"
+        rem_dns = str(getattr(s, "remote_dns_server", "https://1.1.1.1/dns-query") or "https://1.1.1.1/dns-query").strip()
+        bak_dns = str(getattr(s, "backup_remote_dns", "") or "").strip()
+        dir_dns = str(getattr(s, "direct_dns_server", "178.22.122.100") or "").strip()
+        boot_dns = str(getattr(s, "bootstrap_dns_server", "1.1.1.1") or "1.1.1.1").strip()
+        pool_sz = max(4096, min(131072, int(getattr(s, "fake_dns_pool_size", 65535) or 65535)))
+
+        # Static DNS Hosts (also ensures DoH hostnames resolve cleanly without loops)
+        dns_hosts = _parse_static_dns_hosts(getattr(s, "custom_dns_hosts", ""))
+        dns_hosts.setdefault("dns.google", ["8.8.8.8", "8.8.4.4"])
+        dns_hosts.setdefault("cloudflare-dns.com", ["1.1.1.1", "1.0.0.1"])
+        dns_hosts.setdefault("dns.quad9.net", ["9.9.9.9", "149.112.112.112"])
+        dns_hosts.setdefault("dns.adguard-dns.com", ["94.140.14.14", "94.140.15.15"])
+
+        dns_servers = []
+        if fake_dns:
+            fk_pools = [{"ipPool": "198.18.0.0/15", "poolSize": pool_sz}]
+            if q_strat != "UseIPv4":
+                fk_pools.append({"ipPool": "fc00::/18", "poolSize": pool_sz})
+            cfg["fakedns"] = fk_pools
+            dns_servers.append("fakedns")
+
+        if rem_dns:
+            dns_servers.append(rem_dns)
+        if bak_dns and bak_dns != rem_dns:
+            dns_servers.append(bak_dns)
+
+        # Split-Horizon: domestic Iran domains via Direct DNS with anti-poisoning expectIPs
+        if dns_arch != "zero_leak" and dir_dns and has_geosite:
+            dir_obj = {
+                "address": dir_dns,
+                "domains": ["geosite:ir"],
+                "skipFallback": True,
+            }
+            if _is_raw_ip(dir_dns):
+                dir_obj["port"] = 53
+            if has_geoip:
+                dir_obj["expectIPs"] = ["geoip:ir"]
+            dns_servers.append(dir_obj)
+
+        # Bootstrap IP resolver (only if primary/backup use domain-based DoH/DoT)
+        if boot_dns and _is_raw_ip(boot_dns) and boot_dns not in dns_servers:
+            if any(not _is_raw_ip(u.split("://")[-1].split("/")[0].split(":")[0]) for u in (rem_dns, bak_dns) if u):
+                dns_servers.append({"address": boot_dns, "port": 53, "skipFallback": True})
+
+        if not dns_servers:
+            dns_servers = ["https://1.1.1.1/dns-query", "8.8.8.8"]
+
+        dns_cfg = {
+            "tag": "dns-internal",
+            "hosts": dns_hosts,
+            "servers": dns_servers,
+            "queryStrategy": q_strat,
+            "disableFallback": bool(getattr(s, "dns_disable_fallback", True)),
+            "disableFallbackIfMatch": bool(getattr(s, "dns_disable_fallback_if_match", True)),
+            "disableCache": bool(getattr(s, "dns_disable_cache", False)),
+        }
+
+        # Optional EDNS Client Subnet IP override (valid non-private IPv4/IPv6 only)
+        edns_ip = str(getattr(s, "dns_client_ip", "") or "").strip()
+        if edns_ip:
+            try:
+                ip_o = ipaddress.ip_address(edns_ip)
+                if not (ip_o.is_private or ip_o.is_loopback or ip_o.is_multicast):
+                    dns_cfg["clientIp"] = str(ip_o)
+            except ValueError:
+                pass
+
+        cfg["dns"] = dns_cfg
+
+        # 6. Routing & Firewall ACL + DNS Leak Guard (Port 53 Hijack)
+        direct_tag = next((str(o.get("tag")) for o in outbounds if o.get("protocol") == "freedom" and o.get("tag") != "fragment"), "direct")
+        if not any(str(o.get("tag") or "") == direct_tag for o in outbounds):
+            outbounds.append({"tag": direct_tag, "protocol": "freedom", "settings": {}})
+        block_tag = next((str(o.get("tag")) for o in outbounds if o.get("protocol") == "blackhole"), "block")
+        if not any(str(o.get("tag") or "") == block_tag for o in outbounds):
+            outbounds.append({"tag": block_tag, "protocol": "blackhole", "settings": {}})
+
+        hijack_53 = bool(getattr(s, "dns_hijack_port53", True)) or (dns_arch == "zero_leak")
+        if hijack_53 and inbound_tags:
+            if not any(str(o.get("tag") or "") == "dns-out" for o in outbounds):
+                outbounds.append({"tag": "dns-out", "protocol": "dns"})
+
+        routing = cfg.setdefault("routing", {})
+        dom_strat = str(getattr(s, "routing_domain_strategy", "IPIfNonMatch") or "IPIfNonMatch").strip()
+        if dom_strat not in ("AsIs", "IPIfNonMatch", "IPOnDemand"):
+            dom_strat = "IPIfNonMatch"
+        routing["domainStrategy"] = dom_strat
+        rules = routing.setdefault("rules", [])
+
+        prepend_rules = []
+        # Hijack inbound TCP/UDP port 53 -> Xray internal DNS engine (prevents OS DNS leaks)
+        if hijack_53 and inbound_tags:
+            prepend_rules.append({
+                "type": "field",
+                "inboundTag": list(inbound_tags),
+                "port": "53",
+                "outboundTag": "dns-out",
+            })
+
+        if bool(getattr(s, "block_quic_udp443", True)):
+            prepend_rules.append({
+                "type": "field",
+                "network": "udp",
+                "port": "443",
+                "outboundTag": block_tag,
+            })
+
+        b_doms, b_ips = _parse_rule_tokens(getattr(s, "custom_block_rules", ""))
+        if b_doms:
+            prepend_rules.append({"type": "field", "domain": b_doms, "outboundTag": block_tag})
+        if b_ips:
+            prepend_rules.append({"type": "field", "ip": b_ips, "outboundTag": block_tag})
+
+        if bool(getattr(s, "block_ads_malware", True)) and has_geosite:
+            prepend_rules.append({"type": "field", "domain": ["geosite:category-ads-all"], "outboundTag": block_tag})
+
+        p_doms, p_ips = _parse_rule_tokens(getattr(s, "custom_proxy_rules", ""))
+        if p_doms:
+            prepend_rules.append({"type": "field", "domain": p_doms, "outboundTag": p_tag})
+        if p_ips:
+            prepend_rules.append({"type": "field", "ip": p_ips, "outboundTag": p_tag})
+
+        d_doms, d_ips = _parse_rule_tokens(getattr(s, "custom_direct_rules", ""))
+        if d_doms:
+            prepend_rules.append({"type": "field", "domain": d_doms, "outboundTag": direct_tag})
+        if d_ips:
+            prepend_rules.append({"type": "field", "ip": d_ips, "outboundTag": direct_tag})
+
+        if bool(getattr(s, "bypass_lan_private", True)):
+            priv_ips = ["geoip:private"] if has_geoip else ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]
+            prepend_rules.append({"type": "field", "ip": priv_ips, "outboundTag": direct_tag})
+
+        if prepend_rules:
+            rules[:0] = prepend_rules
+
+    return cfg
+
+
+
+def _extract_exact_uri_remark(uri: str) -> str:
+    raw = str(uri or "").strip()
+    if not raw:
+        return ""
+    if raw.lower().startswith("vmess://"):
+        body = raw[8:].split("#", 1)[0].strip()
+        try:
+            std = body.replace("-", "+").replace("_", "/")
+            pad = (-len(std)) % 4
+            js = json.loads(base64.b64decode(std + ("=" * pad)).decode("utf-8", errors="ignore"))
+            ps = str(js.get("ps") or "").strip()
+            if ps:
+                return ps
+        except Exception:
+            pass
+    if "#" in raw:
+        frag = raw.split("#", 1)[1].strip()
+        if frag:
+            dec = urllib.parse.unquote(frag).strip()
+            if dec:
+                return dec
+    return ""
+
+
+def _emit_xray_diag(msg: str):
+    cb = _XRAY_LOG_CALLBACK
+    if callable(cb):
+        try:
+            cb(msg)
+        except Exception:
+            pass
+
+
+def _summarize_xray_pipeline(cfg: dict) -> str:
+    try:
+        inbs = cfg.get("inbounds") or []
+        outs = cfg.get("outbounds") or []
+        if len(inbs) > 4 or not outs:
+            return ""
+        if any(int(i.get("port") or 0) >= 22000 for i in inbs if isinstance(i, dict)):
+            return ""
+        p_out = next((o for o in outs if str(o.get("tag") or "") not in ("direct", "block", "fragment")), outs[0])
+        proto = str(p_out.get("protocol") or "?").upper()
+        st = p_out.get("streamSettings") or {}
+        net = str(st.get("network") or "tcp")
+        sec = str(st.get("security") or "none")
+        sni = (
+            (st.get("tlsSettings") or {}).get("serverName")
+            or (st.get("realitySettings") or {}).get("serverName")
+            or "-"
+        )
+        remote_ep = "?"
+        s_obj = p_out.get("settings") or {}
+        if isinstance(s_obj.get("vnext"), list) and s_obj["vnext"]:
+            remote_ep = f"{s_obj['vnext'][0].get('address', '?')}:{s_obj['vnext'][0].get('port', '?')}"
+        elif isinstance(s_obj.get("servers"), list) and s_obj["servers"]:
+            remote_ep = f"{s_obj['servers'][0].get('address', '?')}:{s_obj['servers'][0].get('port', '?')}"
+
+        listen_ip = str(inbs[0].get("listen") or "127.0.0.1")
+        ports = [f"{str(i.get('protocol', '')).upper()}:{i.get('port', '')}" for i in inbs if i.get("port")]
+        pol = ((cfg.get("policy") or {}).get("levels") or {}).get("0") or {}
+        buf_kb = pol.get("bufferSize", "-")
+        mux_on = bool((p_out.get("mux") or {}).get("enabled", False))
+        frag_on = any(str(o.get("tag") or "") == "fragment" for o in outs)
+        quic_blk = any(
+            isinstance(r, dict) and r.get("network") == "udp" and str(r.get("port")) == "443" and r.get("outboundTag") == "block"
+            for r in ((cfg.get("routing") or {}).get("rules") or [])
+        )
+        s = _get_active_pro_settings()
+        mem_cap = getattr(s, "xray_mem_limit_mb", 48) if s else 48
+        dns_arch = getattr(s, "dns_architecture", "split_horizon") if s else "split_horizon"
+        hj53 = "ON" if (s and getattr(s, "dns_hijack_port53", True)) else "OFF"
+        return (
+            f"[Xray-Pipeline] {proto}/{net}/{sec} | SNI={sni} | NextHop={remote_ep} | "
+            f"Listen={listen_ip}[{', '.join(ports)}] | RAMCap={mem_cap}MiB Buf={buf_kb}KB | "
+            f"Mux={'ON' if mux_on else 'OFF'} QUIC-Block={'ON' if quic_blk else 'OFF'} Frag={'ON' if frag_on else 'OFF'} | DNS={dns_arch} Hijack53={hj53}"
+        )
+    except Exception:
+        return ""
+
+
+def _pump_xray_process_logs(proc):
+    if proc is None or getattr(proc, "stdout", None) is None:
+        return
+    if getattr(proc, "_log_pump_started", False):
+        return
+    proc._log_pump_started = True
+
+    def _reader():
+        win_start = time.monotonic()
+        win_cnt = 0
+        important_keys = (
+            "[error]", "[warning]", "failed", "rejected", "eof", "timeout", "reset by peer",
+        )
+        try:
+            for raw_ln in iter(proc.stdout.readline, ""):
+                ln = str(raw_ln or "").strip()
+                if not ln:
+                    continue
+                low = ln.lower()
+                if any(k in low for k in important_keys):
+                    now = time.monotonic()
+                    if (now - win_start) > 5.0:
+                        win_start = now
+                        win_cnt = 0
+                    if win_cnt < 8:
+                        win_cnt += 1
+                        _emit_xray_diag(f"[Xray-Core] {ln[:220]}")
+        except Exception:
+            pass
+
+    threading.Thread(target=_reader, daemon=True).start()
+
+
+def _xray_json_dump(obj, fp, *args, **kwargs):
+    if isinstance(obj, dict) and ("outbounds" in obj) and ("inbounds" in obj):
+        try:
+            _apply_pro_network_settings(obj)
+            summ = _summarize_xray_pipeline(obj)
+            if summ:
+                _emit_xray_diag(summ)
+        except Exception:
+            pass
+    return json.dump(obj, fp, *args, **kwargs)
+
+
+def _xray_json_dumps(obj, *args, **kwargs):
+    if isinstance(obj, dict) and ("outbounds" in obj) and ("inbounds" in obj):
+        try:
+            _apply_pro_network_settings(obj)
+            summ = _summarize_xray_pipeline(obj)
+            if summ:
+                _emit_xray_diag(summ)
+        except Exception:
+            pass
+    return json.dumps(obj, *args, **kwargs)
+
+
 class UriConfigCodec:
     SUPPORTED_SCHEMES = ("vless://", "vmess://", "trojan://", "ss://", "socks://", "socks5://", "socks4://", "hysteria2://", "hy2://", "tuic://")
 
@@ -601,7 +1176,15 @@ class UriConfigCodec:
         return f"{proto}://{urllib.parse.quote(secret)}@{addr}:{port}?{q_str}#{urllib.parse.quote(name)}"
 
     @classmethod
-    def extract_profile_node(
+    def extract_profile_node(cls, uri: str, *args, **kwargs):
+        node = cls._extract_profile_node_orig(uri, *args, **kwargs)
+        exact_name = _extract_exact_uri_remark(uri)
+        if exact_name and hasattr(node, 'name'):
+            node.name = exact_name
+        return node
+
+    @classmethod
+    def _extract_profile_node_orig(
         cls,
         uri: str,
         group_tag: str = "Manual",
@@ -786,6 +1369,25 @@ class XrayProcessDriver:
     _cached_major_ver: Optional[int] = None
 
 
+
+
+
+
+
+
+
+
+
+    @staticmethod
+    def set_log_callback(fn):
+        global _XRAY_LOG_CALLBACK
+        _XRAY_LOG_CALLBACK = fn
+
+    @staticmethod
+    def set_pro_settings_getter(fn):
+        global _ACTIVE_PRO_SETTINGS_GETTER
+        _ACTIVE_PRO_SETTINGS_GETTER = fn
+
     def _stop_custom_proc_if_any(self):
         proc = getattr(self, "_custom_wg_proc", None)
         if proc is not None:
@@ -824,7 +1426,7 @@ class XrayProcessDriver:
         )
         cfg_path = os.path.join(self.configs_dir, f"xray_socks_{socks_port}.json")
         with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(cfg, fh, indent=2, ensure_ascii=False)
+            _xray_json_dump(cfg, fh, indent=2, ensure_ascii=False)
 
         xray_bin = os.path.join(self.core_dir, "xray.exe" if os.name == "nt" else "xray")
         flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
@@ -888,7 +1490,7 @@ class XrayProcessDriver:
             return 25
         try:
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-            res = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=2.5, creationflags=flags)
+            res = subprocess.run([exe, "version"], capture_output=True, text=True, timeout=2.5, env=_low_mem_xray_env(), creationflags=flags)
             m = re.search(r"Xray\s+(\d+)\.", res.stdout or "")
             if m:
                 XrayProcessDriver._cached_major_ver = int(m.group(1))
@@ -912,7 +1514,7 @@ class XrayProcessDriver:
         tmp_path = os.path.join(self.configs_dir, "_probe_tun.json")
         try:
             with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump(probe_cfg, fh)
+                _xray_json_dump(probe_cfg, fh)
             flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
             res = subprocess.run([exe, "run", "-test", "-c", tmp_path], capture_output=True, timeout=3.0, creationflags=flags)
             self._native_tun_supported = res.returncode == 0
@@ -1140,7 +1742,7 @@ class XrayProcessDriver:
 
         primary_cfg = _assemble_config(minimal=is_lab, force_strip_ins=strip_insecure)
         with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(primary_cfg, fh, indent=2, ensure_ascii=False)
+            _xray_json_dump(primary_cfg, fh, indent=2, ensure_ascii=False)
 
         ok, err_msg = self._spawn_and_wait(exe, cfg_path, log_path, http_p)
         if ok:
@@ -1148,7 +1750,7 @@ class XrayProcessDriver:
 
         fallback_cfg = _assemble_config(minimal=True, force_strip_ins=True)
         with open(cfg_path, "w", encoding="utf-8") as fh:
-            json.dump(fallback_cfg, fh, indent=2, ensure_ascii=False)
+            _xray_json_dump(fallback_cfg, fh, indent=2, ensure_ascii=False)
 
         ok_fb, err_fb = self._spawn_and_wait(exe, cfg_path, log_path, http_p)
         if ok_fb:
@@ -1301,7 +1903,7 @@ class XrayProcessDriver:
                 fd, tmp_cfg_path = tempfile.mkstemp(prefix="ping_", suffix=".json", dir=self.configs_dir)
                 os.close(fd)
                 with open(tmp_cfg_path, "w", encoding="utf-8") as fh:
-                    json.dump(
+                    _xray_json_dump(
                         {
                             "log": {"loglevel": "none"},
                             "inbounds": inbounds,

@@ -9,7 +9,7 @@ on:
       version:
         description: 'Release version (without v, e.g. 1.5.0)'
         required: true
-        default: '1.5.0'
+        default: '1.6.0'
 
 permissions:
   contents: write
@@ -139,7 +139,7 @@ jobs:
           name: Alan-RIP-Dpi ${{ env.TAG }}
           body_path: RELEASE_NOTES.md
           draft: false
-          prerelease: false
+          prerelease: ${{ inputs.prerelease == true || inputs.prerelease == 'true' || contains(github.ref_name, '-') }}
           files: |
             Alan-RIP-Dpi-v${{ env.VERSION }}-Windows-Portable.zip
             SHA256SUMS.txt

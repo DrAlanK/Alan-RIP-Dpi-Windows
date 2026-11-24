@@ -1,3 +1,5 @@
+import subprocess
+import gc
 import base64
 import concurrent.futures
 import copy
@@ -144,6 +146,197 @@ class WindowsSystemProxy:
 
 
 class AlanAutoPilotEngine:
+
+
+
+
+    @staticmethod
+    def _query_pid_ram_mb(pid: int) -> float:
+        if os.name != "nt" or int(pid or 0) <= 0:
+            return 0.0
+        try:
+            import ctypes
+
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", ctypes.c_ulong),
+                    ("PageFaultCount", ctypes.c_ulong),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+
+            k32 = ctypes.windll.kernel32
+            psapi = ctypes.windll.psapi
+            k32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_int, ctypes.c_ulong]
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.CloseHandle.argtypes = [ctypes.c_void_p]
+            k32.CloseHandle.restype = ctypes.c_int
+            psapi.GetProcessMemoryInfo.argtypes = [ctypes.c_void_p, ctypes.POINTER(_PMC), ctypes.c_ulong]
+            psapi.GetProcessMemoryInfo.restype = ctypes.c_int
+
+            h = k32.OpenProcess(0x1000 | 0x0010, 0, int(pid))
+            if not h:
+                h = k32.OpenProcess(0x1000, 0, int(pid))
+            if not h:
+                return 0.0
+            try:
+                pmc = _PMC()
+                pmc.cb = ctypes.sizeof(_PMC)
+                if psapi.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                    return round(pmc.WorkingSetSize / (1024.0 * 1024.0), 1)
+            finally:
+                k32.CloseHandle(h)
+        except Exception:
+            pass
+        return 0.0
+
+    def _get_active_xray_pid(self) -> int:
+        xr = getattr(self, "xray", None)
+        if xr is None:
+            return 0
+        for attr in ("proc", "_proc", "_process", "process"):
+            p = getattr(xr, attr, None)
+            if p is not None and hasattr(p, "poll"):
+                try:
+                    if p.poll() is None:
+                        return int(p.pid)
+                except Exception:
+                    pass
+        return 0
+
+    def get_hardware_usage(self) -> dict:
+        py_mb = self._query_pid_ram_mb(os.getpid())
+        xr_pid = self._get_active_xray_pid()
+        xr_mb = self._query_pid_ram_mb(xr_pid) if xr_pid > 0 else 0.0
+        threads = threading.active_count()
+        return {
+            "python_mb": py_mb,
+            "xray_mb": xr_mb,
+            "total_mb": round(py_mb + xr_mb, 1),
+            "threads": threads,
+            "xray_running": xr_pid > 0,
+        }
+
+    def trim_hardware_memory(self) -> dict:
+        before = self.get_hardware_usage()
+        try:
+            from alan_dpi.engine.bridge import _RELAY_BUF_POOL
+            _RELAY_BUF_POOL.clear()
+        except Exception:
+            pass
+        gc.collect()
+        if os.name == "nt":
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentProcess.restype = ctypes.c_void_p
+                k32.SetProcessWorkingSetSize.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t]
+                k32.SetProcessWorkingSetSize.restype = ctypes.c_int
+                k32.SetProcessWorkingSetSize(k32.GetCurrentProcess(), ctypes.c_size_t(-1), ctypes.c_size_t(-1))
+            except Exception:
+                pass
+        after = self.get_hardware_usage()
+        freed = round(max(0.0, before["total_mb"] - after["total_mb"]), 1)
+        self.emit_log(
+            f"[Hardware-Opt] RAM Trimmed -> Python={after['python_mb']}MB | Xray={after['xray_mb']}MB | "
+            f"Total={after['total_mb']}MB (Freed {freed}MB) | Threads={after['threads']}"
+        )
+        after["freed_mb"] = freed
+        return after
+
+    def _sync_bridge_tuning_from_settings(self) -> None:
+        try:
+            from alan_dpi.engine.bridge import configure_bridge_tuning
+            s = self.settings
+            configure_bridge_tuning(
+                rcvbuf_kb=int(getattr(s, "socket_rcvbuf_kb", 256) or 256),
+                sndbuf_kb=int(getattr(s, "socket_sndbuf_kb", 96) or 96),
+                mss=int(getattr(s, "tcp_maxseg_override", 1220) or 1220),
+                nodelay=bool(getattr(s, "tcp_nodelay_enabled", True)),
+                keepalive_sec=int(getattr(s, "tcp_keepalive_sec", 30) or 30),
+                idle_timeout=int(getattr(s, "xray_conn_idle_sec", 180) or 180),
+            )
+        except Exception:
+            pass
+
+    def apply_pro_settings(self, payload: dict) -> dict:
+        if isinstance(payload, dict):
+            for k, v in payload.items():
+                if hasattr(self.settings, k):
+                    setattr(self.settings, k, v)
+        self._sync_bridge_tuning_from_settings()
+        self._save_settings()
+        s = self.settings
+        self.emit_log(
+            f"[Pro-NetOps] Applied -> LAN={'ON' if getattr(s,'allow_lan',False) else 'OFF'} | "
+            f"QUIC-Block={'ON' if getattr(s,'block_quic_udp443',True) else 'OFF'} | "
+            f"DNS={getattr(s,'remote_dns_server','-')} ({getattr(s,'dns_query_strategy','UseIPv4')}) | "
+            f"Mux={'ON' if getattr(s,'mux_enabled',False) else 'OFF'} | "
+            f"MTU={getattr(s,'tun_mtu',1360)} MSS={getattr(s,'tcp_maxseg_override',1220)} | "
+            f"RAMCap={getattr(s,'xray_mem_limit_mb',48)}MiB Buf={getattr(s,'xray_policy_buffer_kb',128)}KB"
+        )
+        return self.settings.to_dict() if hasattr(self.settings, "to_dict") else dict(vars(self.settings))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
     def __init__(
         self,
         base_dir: str,
@@ -249,6 +442,10 @@ class AlanAutoPilotEngine:
         threading.Thread(target=self._telemetry_ticker_loop, daemon=True).start()
         threading.Thread(target=self._self_healing_watchdog_loop, daemon=True).start()
         threading.Thread(target=self._sync_hidden_auto_pool, daemon=True).start()
+        self.xray.set_pro_settings_getter(lambda: self.settings)
+        self._sync_bridge_tuning_from_settings()
+        if hasattr(self.xray, 'set_log_callback'):
+            self.xray.set_log_callback(self.emit_log)
 
     def _parse_per_app_list(self) -> List[str]:
         raw = self.settings.per_app_list or ""
@@ -1796,6 +1993,7 @@ class AlanAutoPilotEngine:
             else:
                 summary = f"پینگ پایان یافت: {alive_count} از {total} کانفیگ پاسخ دادند"
             self.emit_log(f"[Ping] {summary}")
+            gc.collect()
             self._emit_task_progress(False, 100, summary)
 
         threading.Thread(target=_real_ping_worker, daemon=True).start()
@@ -3557,6 +3755,7 @@ class AlanAutoPilotEngine:
                 self._push_telemetry()
                 if cc:
                     self.emit_log(f"[GeoIP] Egress IP: {ip_only} | Country: {c_en} ({cc})")
+                    self._start_connection_watchdog(gen_id)
 
         threading.Thread(target=_post_connect_tun_and_geo, daemon=True).start()
 
@@ -3665,3 +3864,254 @@ class AlanAutoPilotEngine:
                             daemon=True,
                         )
                         self._worker_thread.start()
+
+    @staticmethod
+    def _build_rfc1035_query(domain: str) -> Tuple[int, bytes]:
+        import random
+        import struct
+        txid = random.randint(1000, 65000)
+        hdr = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+        qname = b"".join(bytes([len(p)]) + p.encode("ascii") for p in domain.strip(".").split(".")) + b"\x00"
+        return txid, hdr + qname + struct.pack("!HH", 1, 1)
+
+    @staticmethod
+    def _parse_rfc1035_a_records(pkt: bytes) -> List[str]:
+        import socket
+        import struct
+        if len(pkt) < 12:
+            return []
+        qdcount, ancount = struct.unpack_from("!HH", pkt, 4)
+        pos = 12
+        for _ in range(qdcount):
+            while pos < len(pkt):
+                ln = pkt[pos]
+                if ln == 0:
+                    pos += 1
+                    break
+                if (ln & 0xC0) == 0xC0:
+                    pos += 2
+                    break
+                pos += 1 + ln
+            pos += 4
+        ips = []
+        for _ in range(ancount):
+            if pos >= len(pkt):
+                break
+            while pos < len(pkt):
+                ln = pkt[pos]
+                if ln == 0:
+                    pos += 1
+                    break
+                if (ln & 0xC0) == 0xC0:
+                    pos += 2
+                    break
+                pos += 1 + ln
+            if pos + 10 > len(pkt):
+                break
+            rtype, _rclass, _ttl, rdlen = struct.unpack_from("!HHIH", pkt, pos)
+            pos += 10
+            if pos + rdlen > len(pkt):
+                break
+            if rtype == 1 and rdlen == 4:
+                ips.append(socket.inet_ntoa(pkt[pos : pos + 4]))
+            pos += rdlen
+        return ips
+
+    @classmethod
+    def probe_udp_dns_poisoning(cls, server_ip: str, domain: str = "youtube.com", timeout: float = 2.2) -> Tuple[bool, int, str, bool]:
+        """Returns (reachable, rtt_ms, first_ip, is_poisoned_10_10_34)."""
+        import socket
+        _tx, q_pkt = cls._build_rfc1035_query(domain)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        t0 = time.perf_counter()
+        try:
+            sock.sendto(q_pkt, (server_ip, 53))
+            data, _ = sock.recvfrom(1024)
+            ms = int((time.perf_counter() - t0) * 1000)
+            ips = cls._parse_rfc1035_a_records(data)
+            first_ip = ips[0] if ips else "-"
+            poisoned = any(ip.startswith("10.10.34.") or ip == "0.0.0.0" for ip in ips)
+            return True, ms, first_ip, poisoned
+        except Exception:
+            return False, -1, "", False
+        finally:
+            sock.close()
+
+    def benchmark_dns_servers_async(self, callback=None) -> None:
+        """
+        Concurrently benchmarks DoH + UDP DNS servers, detects Iranian 10.10.34.x
+        DNS poisoning, and returns the fastest CLEAN resolver to the UI.
+        """
+        def _worker():
+            import concurrent.futures
+            import requests
+
+            self.emit_log("[DNS-Lab] Running live DNS Benchmark & Anti-Poisoning (10.10.34.x) probe...")
+            use_px = bool(self.snapshot.is_connected and getattr(self.xray, "active_http_port", 0) > 0)
+            px_url = f"http://127.0.0.1:{self.xray.active_http_port}" if use_px else ""
+
+            doh_targets = [
+                ("Cloudflare DoH", "https://1.1.1.1/dns-query"),
+                ("Google DoH", "https://dns.google/dns-query"),
+                ("Quad9 DoH", "https://dns.quad9.net/dns-query"),
+                ("AdGuard DoH", "https://dns.adguard-dns.com/dns-query"),
+                ("ControlD DoH", "https://freedns.controld.com/p0"),
+            ]
+            udp_targets = [
+                ("Cloudflare UDP", "1.1.1.1"),
+                ("Google UDP", "8.8.8.8"),
+                ("Shecan (شکن)", "178.22.122.100"),
+                ("403.online", "10.202.10.202"),
+                ("Electro", "78.157.42.100"),
+            ]
+
+            def _probe_doh(name: str, url: str):
+                sess = requests.Session()
+                sess.trust_env = False
+                if px_url:
+                    sess.proxies = {"http": px_url, "https": px_url}
+                t0 = time.perf_counter()
+                try:
+                    _tx, q_pkt = self._build_rfc1035_query("youtube.com")
+                    r = sess.post(
+                        url,
+                        data=q_pkt,
+                        headers={"Content-Type": "application/dns-message", "Accept": "application/dns-message"},
+                        timeout=3.5,
+                    )
+                    ms = int((time.perf_counter() - t0) * 1000)
+                    if r.status_code == 200 and len(r.content) > 12:
+                        ips = self._parse_rfc1035_a_records(r.content)
+                        poisoned = any(ip.startswith("10.10.34.") for ip in ips)
+                        return {"name": name, "addr": url, "kind": "DoH", "ok": True, "ms": ms, "ip": ips[0] if ips else "-", "poisoned": poisoned}
+                    return {"name": name, "addr": url, "kind": "DoH", "ok": False, "ms": 9999, "ip": f"HTTP {r.status_code}", "poisoned": False}
+                except Exception as exc:
+                    return {"name": name, "addr": url, "kind": "DoH", "ok": False, "ms": 9999, "ip": type(exc).__name__, "poisoned": False}
+                finally:
+                    sess.close()
+
+            def _probe_udp(name: str, ip_s: str):
+                ok, ms, ans_ip, poisoned = self.probe_udp_dns_poisoning(ip_s, "youtube.com", timeout=2.2)
+                return {"name": name, "addr": ip_s, "kind": "UDP", "ok": ok, "ms": ms if ok else 9999, "ip": ans_ip or "Timeout", "poisoned": poisoned}
+
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(_probe_doh, n, u) for n, u in doh_targets] + [ex.submit(_probe_udp, n, u) for n, u in udp_targets]
+                for f in concurrent.futures.as_completed(futs):
+                    try:
+                        results.append(f.result())
+                    except Exception:
+                        pass
+
+            results.sort(key=lambda x: (0 if (x["ok"] and not x["poisoned"]) else (1 if x["ok"] else 2), x["ms"]))
+            for r in results:
+                tag = "CLEAN" if (r["ok"] and not r["poisoned"]) else ("POISONED(10.10.34.x)" if r["poisoned"] else "FAIL")
+                self.emit_log(f"[DNS-Bench] {r['name']} ({r['addr']}) -> {tag} | {r['ms']}ms | ans={r['ip']}")
+
+            clean_doh = [r for r in results if r["ok"] and (not r["poisoned"]) and r["kind"] == "DoH"]
+            clean_any = [r for r in results if r["ok"] and (not r["poisoned"])]
+            winner = clean_doh[0] if clean_doh else (clean_any[0] if clean_any else None)
+            poisoned_cnt = sum(1 for r in results if r["poisoned"])
+
+            if winner:
+                summary = (
+                    f"سریع‌ترین DNS تمیز: {winner['name']} ({winner['ms']}ms) | "
+                    f"مسمومیت شناسایی‌شده در UDP ایران: {poisoned_cnt} سرور"
+                )
+                if callable(callback):
+                    callback(winner["addr"], summary)
+            else:
+                summary = f"پاسخ DoH مستقیم دریافت نشد (ابتدا متصل شوید و دوباره بنچمارک بگیرید) | مسمومیت UDP: {poisoned_cnt}"
+                if callable(callback):
+                    callback("", summary)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def flush_windows_dns_cache(self) -> str:
+        if os.name != "nt":
+            return "کش DNS فقط در ویندوز پاکسازی می‌شود."
+        try:
+            res = subprocess.run(
+                ["ipconfig", "/flushdns"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW,
+                timeout=5.0,
+            )
+            if res.returncode == 0:
+                self.emit_log("[DNS-Lab] Windows DNS Resolver Cache flushed successfully (ipconfig /flushdns).")
+                return "کش DNS ویندوز با موفقیت پاکسازی شد (ipconfig /flushdns)."
+            return "اجرای دستور پاکسازی کش DNS با خطا مواجه شد."
+        except Exception as exc:
+            return f"خطا در پاکسازی کش DNS: {exc}"
+
+    def _start_connection_watchdog(self, gen_id: int) -> None:
+        if not bool(getattr(self.settings, "watchdog_enabled", True)):
+            return
+        if getattr(self, "_watchdog_gen", -1) == gen_id:
+            return
+        self._watchdog_gen = gen_id
+
+        def _wd_loop():
+            import requests
+            fails = 0
+            while not self._is_op_cancelled(gen_id) and self.snapshot.is_connected:
+                iv = max(10, min(120, int(getattr(self.settings, "watchdog_interval_sec", 25) or 25)))
+                for _ in range(iv):
+                    if self._is_op_cancelled(gen_id) or not self.snapshot.is_connected:
+                        return
+                    time.sleep(1.0)
+                if not bool(getattr(self.settings, "watchdog_enabled", True)):
+                    continue
+                port = int(getattr(self.xray, "active_http_port", 0) or 0)
+                if port <= 0:
+                    continue
+                sess = requests.Session()
+                sess.trust_env = False
+                sess.proxies = {"http": f"http://127.0.0.1:{port}", "https": f"http://127.0.0.1:{port}"}
+                try:
+                    r = sess.get("http://www.gstatic.com/generate_204", timeout=5.0)
+                    if r.status_code in (200, 204):
+                        fails = 0
+                    else:
+                        fails += 1
+                except Exception:
+                    fails += 1
+                finally:
+                    sess.close()
+
+                if fails >= 2:
+                    self.emit_log("[Watchdog] Tunnel stall detected (2 consecutive health-check misses).")
+                    if bool(getattr(self.settings, "watchdog_auto_heal", True)):
+                        self.emit_log("[Watchdog] Triggering automatic Hot-Reload Auto-Heal...")
+                        self.hot_reload_active_connection()
+                        return
+                    fails = 0
+
+        threading.Thread(target=_wd_loop, daemon=True).start()
+
+    def hot_reload_active_connection(self) -> bool:
+        """Applies updated Pro NetOps / DNS settings immediately to the active connection."""
+        if not self.snapshot.is_connected:
+            return False
+        node = getattr(self, "_active_runtime_node", None)
+        uid = getattr(node, "uid", "") if node is not None else ""
+        self.emit_log("[Pro-NetOps] Hot-Reloading active tunnel with new DNS/Socket/Routing config...")
+        for m_name in ("connect_profile", "connect_node", "connect_user_profile", "start_connection", "connect"):
+            fn = getattr(self, m_name, None)
+            if callable(fn):
+                try:
+                    import inspect
+                    sig = inspect.signature(fn)
+                    if uid and len(sig.parameters) >= 1:
+                        fn(uid)
+                    else:
+                        fn()
+                    return True
+                except Exception as exc:
+                    self.emit_log(f"[Pro-NetOps] Hot-Reload invoke ({m_name}) note: {exc}")
+        return False
+

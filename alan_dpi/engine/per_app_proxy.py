@@ -6,6 +6,10 @@ import socket
 import struct
 import subprocess
 import threading
+try:
+    threading.stack_size(131072)
+except Exception:
+    pass
 import time
 import urllib.parse
 from typing import Callable, Dict, List, Optional, Set, Tuple
@@ -160,7 +164,7 @@ class WindowsProcessInspector:
         now = time.monotonic()
         with cls._cache_lock:
             cached = cls._pid_path_cache.get(pid)
-            if cached and (now - cached[0]) < 8.0:
+            if cached and (now - cached[0]) < 20.0:
                 return cached[1]
         kernel32 = ctypes.windll.kernel32
         h_proc = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
@@ -171,6 +175,8 @@ class WindowsProcessInspector:
             sz = wintypes.DWORD(1024)
             res = buf.value if kernel32.QueryFullProcessImageNameW(h_proc, 0, buf, ctypes.byref(sz)) else ""
             with cls._cache_lock:
+                if len(cls._pid_path_cache) > 512:
+                    cls._pid_path_cache.clear()
                 cls._pid_path_cache[pid] = (now, res)
             return res
         finally:
@@ -181,7 +187,7 @@ class WindowsProcessInspector:
         now = time.monotonic()
         if use_cache:
             with cls._cache_lock:
-                if cls._proc_table_cache and ((now - cls._proc_table_ts) < 1.2):
+                if cls._proc_table_cache and ((now - cls._proc_table_ts) < 3.0):
                     return cls._proc_table_cache
 
         table: Dict[int, Tuple[str, int, str]] = {}
@@ -330,7 +336,7 @@ class WindowsProcessInspector:
 
 
 class PerAppSplitGateway:
-    BUFFER_SIZE = 65536
+    BUFFER_SIZE = 32768
 
     def __init__(self, log_fn: Optional[Callable[[str], None]] = None):
         self._log_fn = log_fn
@@ -455,14 +461,13 @@ class PerAppSplitGateway:
     def _should_tunnel_client(self, client_port: int) -> Tuple[bool, str]:
         with self._lock:
             mode = self.mode
+            if mode in ("off", "", "all") or (not self.target_apps):
+                return True, ""
             targets = set(self.target_apps)
 
         pid = WindowsProcessInspector.get_pid_for_local_tcp_port(client_port)
         matched, exe_name = WindowsProcessInspector.does_pid_match_target_set(pid, targets)
         label = exe_name or (f"pid-{pid}" if pid > 0 else "unknown")
-
-        if mode in ("off", "", "all") or (not targets):
-            return True, label
         if mode in ("include", "whitelist", "only_selected"):
             return matched, label
         if mode in ("exclude", "blacklist", "bypass_selected"):
@@ -579,11 +584,12 @@ class PerAppSplitGateway:
 
             def _pump(src: socket.socket, dst: socket.socket):
                 try:
+                    mv = memoryview(bytearray(self.BUFFER_SIZE))
                     while True:
-                        buf = src.recv(self.BUFFER_SIZE)
-                        if not buf:
+                        n = src.recv_into(mv)
+                        if not n:
                             break
-                        dst.sendall(buf)
+                        dst.sendall(mv[:n])
                 except Exception:
                     pass
                 finally:
