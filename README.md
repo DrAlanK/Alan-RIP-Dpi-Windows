@@ -1,9 +1,9 @@
 <div align="center">
   <img src="assets/alanripdpi.png" alt="Alan-RIP-Dpi" width="240" />
-  <h1>Alan-RIP-Dpi (Windows Desktop) — v1.6.0</h1>
+  <h1>Alan-RIP-Dpi (Windows Desktop) — v1.6.1</h1>
   <p><b>Adaptive Anti-DPI Engine, Pro NetOps 5-Tab Control Center, Super DNS Lab, Low-RAM Core & Xray Routing Client for Windows</b></p>
   <p>
-    <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases">Download Releases (v1.6.0 Pre-release)</a>
+    <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest">Download Latest Release (v1.6.1)</a>
     ·
     <a href="https://github.com/DrAlanK/Alan-RIP-Dpi-Android">Android Version (Alan-RIP-Dpi-Android)</a>
     ·
@@ -42,7 +42,7 @@
 
 ### ۱. نحوه قرارگیری Mutator، Super DNS و Hardware Engine در کنار هسته `Xray-core`
 
-در معماری `Alan-RIP-Dpi v1.6.0`، هسته استاندارد `xray.exe` تحت محدودیت حافظه Go Runtime (`GOMEMLIMIT` / `GOGC` / `Policy BufferSize`) وظیفه رمزنگاری پروتکل‌ها، اجرای معماری **Super DNS Lab** (با `Port-53 Hijack` و `FakeDNS`)، قوانین **فایروال و مسیریابی** و کارت شبکه مجازی `Wintun` (`AlanTUN`) را بر عهده دارد و ترافیک خروجی را از طریق پل دوطرفه ضد DPI عبور می‌دهد:
+در معماری `Alan-RIP-Dpi v1.6.1`، هسته استاندارد `xray.exe` تحت محدودیت حافظه Go Runtime (`GOMEMLIMIT` / `GOGC` / `Policy BufferSize`) وظیفه رمزنگاری پروتکل‌ها، اجرای معماری **Super DNS Lab** (با `Port-53 Hijack` و `FakeDNS`)، قوانین **فایروال و مسیریابی** و کارت شبکه مجازی `Wintun` (`AlanTUN`) را بر عهده دارد و ترافیک خروجی را از طریق پل دوطرفه ضد DPI عبور می‌دهد:
 
 ```text
 [ Windows Apps / Per-App Split Gateway (:10811) / AlanTUN (MTU 1360) ]

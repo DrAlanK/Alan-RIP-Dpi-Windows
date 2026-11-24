@@ -41,7 +41,7 @@ class AlanQtBackendController(QObject):
         super().__init__(parent)
         self._ui_queue: "queue.SimpleQueue[tuple]" = queue.SimpleQueue()
         self._ui_pump = QTimer(self)
-        self._ui_pump.setInterval(25)
+        self._ui_pump.setInterval(100)
         self._ui_pump.timeout.connect(self._drain_ui_queue)
         self._ui_pump.start()
 

@@ -4395,7 +4395,7 @@ class AboutPage(QWidget):
         t_line.setSpacing(10)
         self.title_lbl = QLabel("Alan-RIP-Dpi")
         self.title_lbl.setObjectName("PageTitle")
-        self.ver_pill = QLabel("v1.6.0")
+        self.ver_pill = QLabel("v1.6.1")
         self.ver_pill.setObjectName("EmeraldPill")
         enforce_english_ltr(self.ver_pill, mono_size=10, bold=True)
         t_line.addWidget(self.title_lbl)
@@ -4507,7 +4507,7 @@ class AboutPage(QWidget):
         self.btn_check_upd.setEnabled(True)
         if not isinstance(info, dict):
             return
-        cur_v = str(info.get("current_version") or "1.6.0")
+        cur_v = str(info.get("current_version") or "1.6.1")
         lat_v = str(info.get("latest_version") or cur_v)
         self.ver_pill.setText(f"v{cur_v}")
 

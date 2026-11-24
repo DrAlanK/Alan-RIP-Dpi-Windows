@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 
 
 APP_NAME = "Alan-RIP-Dpi"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 
 
 COUNTRY_METADATA: Dict[str, Tuple[str, str]] = {

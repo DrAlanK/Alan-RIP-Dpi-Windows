@@ -62,6 +62,7 @@ from .theme import (
 )
 from .vector_icons import VectorIconPainter
 from alan_dpi.ui.animated_widgets import PowerAwareTimerController
+from PySide6.QtCore import QEvent
 
 _IPV4_COUNTRY_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
     (
@@ -527,8 +528,8 @@ class DemoDpiController(BackendControllerAdapter):
                 {
                     "ok": True,
                     "has_update": False,
-                    "current_version": "1.6.0",
-                    "latest_version": "1.6.0",
+                    "current_version": "1.6.1",
+                    "latest_version": "1.6.1",
                     "release_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
                     "download_url": "https://github.com/DrAlanK/Alan-RIP-Dpi-Windows/releases/latest",
                     "notes": "",
@@ -1254,7 +1255,7 @@ class TopBrandHeaderBar(NeuCard):
         self.brand_lbl = QLabel("Alan-RIP-Dpi")
         enforce_english_ltr(self.brand_lbl, mono_size=12, bold=True)
 
-        self.ver_badge = QLabel("v1.6.0")
+        self.ver_badge = QLabel("v1.6.1")
         self.ver_badge.setObjectName("BadgePill")
         enforce_english_ltr(self.ver_badge, mono_size=9, bold=True)
 
@@ -1438,7 +1439,7 @@ class AlanMainWindow(QMainWindow):
             VectorIconPainter.build_tray_icon("IDLE", "assets/logo.png"),
             self,
         )
-        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.6.0")
+        self.tray_icon.setToolTip("Alan-RIP-Dpi v1.6.1")
 
         self.tray_menu = QMenu(self)
         self.act_tray_conn = QAction(I18N.t("tray_connect"), self)
@@ -2364,31 +2365,9 @@ class AlanMainWindow(QMainWindow):
         finally:
             self.setUpdatesEnabled(True)
 
-    def _setup_power_guard(self) -> None:
-        self._power_guard = PowerAwareTimerController(self)
-        self._power_guard.optimize_widget_tree(self)
 
-    def changeEvent(self, event) -> None:
-        super().changeEvent(event)
-        pg = getattr(self, '_power_guard', None)
-        if pg is None:
-            return
-        if self.isMinimized():
-            pg.pause_animations_in(self)
-        elif not self.isHidden():
-            pg.resume_animations_in(self)
 
-    def hideEvent(self, event) -> None:
-        super().hideEvent(event)
-        pg = getattr(self, '_power_guard', None)
-        if pg is not None:
-            pg.pause_animations_in(self)
 
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        pg = getattr(self, '_power_guard', None)
-        if pg is not None:
-            pg.resume_animations_in(self)
 
     def _wire_pro_settings_hub(self) -> None:
         rp = getattr(self, 'routing_page', None) or getattr(self, 'settings_page', None)
@@ -2439,6 +2418,36 @@ class AlanMainWindow(QMainWindow):
             rp.load_pro_settings(s_dict)
             _apply_power_from_dict(s_dict)
             rp.update_hardware_badge(ctrl.engine.get_hardware_usage())
+
+    def _setup_power_guard(self) -> None:
+        self._power_guard = PowerAwareTimerController(self)
+        QTimer.singleShot(300, self._init_power_guard_deferred)
+
+    def _init_power_guard_deferred(self) -> None:
+        pg = getattr(self, '_power_guard', None)
+        if pg is not None:
+            pg.optimize_widget_tree(self)
+            pg.sync_window_power(self)
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        et = event.type()
+        if et in (QEvent.Type.WindowStateChange, QEvent.Type.ActivationChange):
+            pg = getattr(self, '_power_guard', None)
+            if pg is not None:
+                pg.sync_window_power(self)
+
+    def hideEvent(self, event) -> None:
+        super().hideEvent(event)
+        pg = getattr(self, '_power_guard', None)
+        if pg is not None:
+            pg.pause_animations_in(self, trim_ws=True)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        pg = getattr(self, '_power_guard', None)
+        if pg is not None:
+            QTimer.singleShot(50, lambda: pg.sync_window_power(self))
 
 
 

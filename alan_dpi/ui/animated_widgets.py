@@ -2641,19 +2641,51 @@ def _trim_windows_working_set() -> None:
 
 class PowerAwareTimerController(QObject):
     """
-    Zero-impact RAM/CPU guard:
-      - Keeps animations 100% smooth while window is visible (unless Eco Mode is enabled).
-      - Caps QPlainTextEdit log memory dynamically (default 250 lines).
-      - Pauses animation timers + trims Windows working-set RAM when minimized or in Tray.
-      - Resumes all paused timers unconditionally when window returns to foreground.
+    Zero-risk CPU & RAM governor (NEVER touches networking, Xray, or telemetry timers >= 100ms):
+      - Keeps animations at 100% full native speed while the active tab is focused.
+      - Strips CPU-heavy QGraphicsDropShadowEffect ONLY on actively animating widget subtrees
+        (eliminates 60fps full-card software Gaussian blur storms).
+      - Automatically pauses decorative animation timers (1..85ms) & QAbstractAnimations on:
+          1) Inactive QStackedWidget tabs (e.g. Home orb/bubbles pause when on Configs/Settings)
+          2) Unfocused/background window (e.g. when browsing Chrome/Telegram/Task Manager)
+          3) Minimized or hidden-to-tray window (+ trims Windows Working Set RAM)
+      - Instantly resumes animations the moment the window/tab becomes active again.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._paused_timers: set = set()
+        self._paused_anims: set = set()
+        self._connected_stacks: set = set()
         self.tray_ram_trim_enabled: bool = True
         self.eco_mode: bool = False
         self.max_log_lines: int = 250
+        self.stripped_shadow_count: int = 0
+
+    @staticmethod
+    def _collect_decorative_timers(root: QWidget) -> set:
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QWidget as _QW
+        found = set()
+        if root is None:
+            return found
+        for t in root.findChildren(QTimer):
+            iv = int(t.interval())
+            if isinstance(t.parent(), _QW) and (1 <= iv <= 85):
+                found.add(t)
+        for w in root.findChildren(_QW):
+            for attr in ("_timer", "timer", "_anim_timer", "anim_timer", "_frame_timer", "_wave_timer", "_orb_timer"):
+                obj = getattr(w, attr, None)
+                if isinstance(obj, QTimer) and (1 <= int(obj.interval()) <= 85):
+                    found.add(obj)
+        return found
+
+    @staticmethod
+    def _collect_decorative_anims(root: QWidget) -> set:
+        from PySide6.QtCore import QAbstractAnimation
+        if root is None:
+            return set()
+        return set(root.findChildren(QAbstractAnimation))
 
     def configure(self, max_log_lines: int = 250, tray_ram_trim: bool = True, eco_mode: bool = False, root: QWidget = None) -> None:
         self.max_log_lines = max(80, min(1500, int(max_log_lines or 250)))
@@ -2661,35 +2693,74 @@ class PowerAwareTimerController(QObject):
         self.eco_mode = bool(eco_mode)
         if root is not None:
             self.optimize_widget_tree(root)
-            if self.eco_mode:
-                self.pause_animations_in(root, trim_ws=False)
-            elif not (root.isMinimized() or root.isHidden()):
-                self.resume_animations_in(root)
+            self.sync_window_power(root)
 
     def optimize_widget_tree(self, root: QWidget) -> int:
+        from PySide6.QtWidgets import QGraphicsDropShadowEffect, QPlainTextEdit, QStackedWidget, QWidget as _QW
         if root is None:
             return 0
-        capped = 0
-        try:
-            from PySide6.QtWidgets import QPlainTextEdit
-            for ed in root.findChildren(QPlainTextEdit):
-                if ed.maximumBlockCount() == 0 or ed.maximumBlockCount() != self.max_log_lines:
-                    ed.setMaximumBlockCount(self.max_log_lines)
-                    capped += 1
-        except Exception:
-            pass
-        return capped
+        changes = 0
 
-    def pause_animations_in(self, root: QWidget, trim_ws: bool = True) -> int:
+        # 1. Cap QPlainTextEdit log lines to prevent unbounded RAM growth
+        for ed in root.findChildren(QPlainTextEdit):
+            if ed.maximumBlockCount() == 0 or ed.maximumBlockCount() != self.max_log_lines:
+                ed.setMaximumBlockCount(self.max_log_lines)
+                changes += 1
+
+        # 2. Strip software-CPU QGraphicsDropShadowEffect ONLY on widgets hosting fast animation timers
+        #    and their immediate ancestor cards (eliminates 60fps Gaussian blur on CPU)
+        anim_widgets = set()
+        for t in self._collect_decorative_timers(root):
+            p = t.parent()
+            if isinstance(p, _QW):
+                anim_widgets.add(p)
+        for a in self._collect_decorative_anims(root):
+            p = a.parent()
+            if isinstance(p, _QW):
+                anim_widgets.add(p)
+
+        for aw in anim_widgets:
+            cur = aw
+            for _ in range(4):
+                if cur is None or cur is root:
+                    break
+                eff = cur.graphicsEffect()
+                if isinstance(eff, QGraphicsDropShadowEffect):
+                    cur.setGraphicsEffect(None)
+                    self.stripped_shadow_count += 1
+                    changes += 1
+                cur = cur.parentWidget()
+
+        # 3. Hook every QStackedWidget so off-tab animations auto-pause
+        for stk in root.findChildren(QStackedWidget):
+            sid = id(stk)
+            if sid not in self._connected_stacks:
+                self._connected_stacks.add(sid)
+                stk.currentChanged.connect(lambda _idx, _r=root: self.sync_window_power(_r))
+
+        return changes
+
+    def pause_animations_in(self, root: QWidget, trim_ws: bool = False) -> int:
+        from PySide6.QtCore import QAbstractAnimation
         if root is None:
             return 0
         paused = 0
-        for t in root.findChildren(QTimer):
-            iv = int(t.interval())
-            if t.isActive() and (1 <= iv <= 120):
-                t.stop()
-                self._paused_timers.add(t)
-                paused += 1
+        for t in self._collect_decorative_timers(root):
+            try:
+                if t.isActive():
+                    t.stop()
+                    self._paused_timers.add(t)
+                    paused += 1
+            except RuntimeError:
+                pass
+        for a in self._collect_decorative_anims(root):
+            try:
+                if a.state() == QAbstractAnimation.State.Running:
+                    a.pause()
+                    self._paused_anims.add(a)
+                    paused += 1
+            except RuntimeError:
+                pass
         if trim_ws and self.tray_ram_trim_enabled:
             import gc
             gc.collect()
@@ -2697,15 +2768,77 @@ class PowerAwareTimerController(QObject):
         return paused
 
     def resume_animations_in(self, root: QWidget) -> int:
+        from PySide6.QtCore import QAbstractAnimation
         if root is None or self.eco_mode:
             return 0
         resumed = 0
+        allowed_timers = self._collect_decorative_timers(root)
         for t in list(self._paused_timers):
-            self._paused_timers.discard(t)
-            try:
-                if not t.isActive():
-                    t.start()
-                    resumed += 1
-            except RuntimeError:
-                pass
+            if t in allowed_timers:
+                self._paused_timers.discard(t)
+                try:
+                    if not t.isActive():
+                        t.start()
+                        resumed += 1
+                except RuntimeError:
+                    pass
+        allowed_anims = self._collect_decorative_anims(root)
+        for a in list(self._paused_anims):
+            if a in allowed_anims:
+                self._paused_anims.discard(a)
+                try:
+                    if a.state() == QAbstractAnimation.State.Paused:
+                        a.resume()
+                        resumed += 1
+                except RuntimeError:
+                    pass
         return resumed
+
+    def sync_window_power(self, win: QWidget) -> None:
+        from PySide6.QtWidgets import QStackedWidget
+        if win is None:
+            return
+        # Minimized or hidden to System Tray -> pause all decorative animations + trim RAM
+        if win.isMinimized() or win.isHidden():
+            self.pause_animations_in(win, trim_ws=True)
+            return
+        # Eco mode or window in background (behind Chrome / Telegram / Task Manager) -> pause decorative animations
+        if self.eco_mode or (not win.isActiveWindow()):
+            self.pause_animations_in(win, trim_ws=False)
+            return
+
+        # Window is visible AND focused -> resume active tab, pause hidden tabs
+        stacks = win.findChildren(QStackedWidget)
+        if not stacks:
+            self.resume_animations_in(win)
+            return
+
+        hidden_timers = set()
+        hidden_anims = set()
+        for stk in stacks:
+            cur_w = stk.currentWidget()
+            for i in range(stk.count()):
+                w = stk.widget(i)
+                if w is not None and w is not cur_w:
+                    self.pause_animations_in(w, trim_ws=False)
+                    hidden_timers.update(self._collect_decorative_timers(w))
+                    hidden_anims.update(self._collect_decorative_anims(w))
+
+        # Resume everything in `win` EXCEPT timers/anims belonging to hidden stacked tabs
+        from PySide6.QtCore import QAbstractAnimation
+        for t in list(self._paused_timers):
+            if t not in hidden_timers:
+                self._paused_timers.discard(t)
+                try:
+                    if not t.isActive():
+                        t.start()
+                except RuntimeError:
+                    pass
+        for a in list(self._paused_anims):
+            if a not in hidden_anims:
+                self._paused_anims.discard(a)
+                try:
+                    if a.state() == QAbstractAnimation.State.Paused:
+                        a.resume()
+                except RuntimeError:
+                    pass
